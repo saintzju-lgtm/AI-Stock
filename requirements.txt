@@ -1,5 +1,14 @@
 streamlit
+yfinance
 pandas
 numpy
-akshare
+scikit-learn
+requests
+streamlit-autorefresh
+pytz
+requests
+altair
+scipy
 plotly
+mplfinance
+matplotlib
