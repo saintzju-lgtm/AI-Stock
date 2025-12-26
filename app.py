@@ -1,277 +1,321 @@
 import streamlit as st
-import akshare as ak
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
-import datetime
-import time  # 修复超时所需的库
-from io import BytesIO
+import time
+import requests
+from datetime import datetime, timedelta
+import pytz
+from streamlit_autorefresh import st_autorefresh
 
-# --- 1. 页面与样式配置 ---
-st.set_page_config(page_title="A股全能量化(稳定版)", layout="wide", page_icon="📈")
+# --- 1. 页面配置 ---
+st.set_page_config(page_title="BTDR Pilot v7.4", layout="centered")
 
-# 注入 CSS 优化界面
+# 5秒刷新
+st_autorefresh(interval=5000, limit=None, key="realtime_counter")
+
+# CSS: 定义统一的卡片样式 (Unified Card Style)
 st.markdown("""
-<style>
-    .metric-card { background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin-bottom: 10px; }
-    .stProgress > div > div > div > div { background-color: #00cc96; }
-    .risk-high { color: #ff4b4b; font-weight: bold; }
-    .risk-low { color: #00cc96; font-weight: bold; }
-</style>
-""", unsafe_allow_html=True)
+    <style>
+    /* 基础重置 */
+    html { overflow-y: scroll; }
+    .stApp > header { display: none; }
+    .stApp { margin-top: -30px; background-color: #ffffff; }
+    div[data-testid="stStatusWidget"] { visibility: hidden; }
+    
+    h1, h2, h3, div, p, span { 
+        color: #212529 !important; 
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif !important; 
+    }
+    
+    /* 统一的指标卡片样式 (替代 st.metric) */
+    .metric-card {
+        background-color: #f8f9fa;
+        border: 1px solid #e9ecef;
+        border-radius: 12px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+        height: 95px; /* 统一高度 */
+        padding: 0 16px;
+        display: flex; 
+        flex-direction: column; 
+        justify-content: center;
+        overflow: hidden;
+        transition: transform 0.2s;
+    }
+    
+    /* 标签行 */
+    .metric-label {
+        font-size: 0.75rem; 
+        color: #888; 
+        display: flex; 
+        align-items: center;
+        margin-bottom: 2px;
+    }
+    
+    /* 数值行 (大号字体) - 重点修复：所有数字都一样大 */
+    .metric-value {
+        font-size: 1.8rem; 
+        font-weight: 700; 
+        color: #212529; 
+        line-height: 1.2;
+        letter-spacing: -0.5px;
+    }
+    
+    /* 涨跌幅行 */
+    .metric-delta {
+        font-size: 0.9rem; 
+        font-weight: 600;
+        margin-top: 2px;
+    }
+    
+    /* 颜色定义 */
+    .color-up { color: #0ca678; }
+    .color-down { color: #d6336c; }
+    .color-neutral { color: #adb5bd; }
+    
+    /* 预测容器 */
+    .pred-container-wrapper { height: 110px; width: 100%; display: block; }
+    .pred-box {
+        padding: 0 10px; border-radius: 12px; text-align: center;
+        height: 100%; display: flex; flex-direction: column; justify-content: center;
+    }
+    
+    /* 状态小圆点 */
+    .status-dot { height: 6px; width: 6px; border-radius: 50%; display: inline-block; margin-left: 6px; margin-bottom: 2px;}
+    .dot-pre { background-color: #f59f00; box-shadow: 0 0 4px #f59f00; }
+    .dot-reg { background-color: #0ca678; box-shadow: 0 0 4px #0ca678; }
+    .dot-post { background-color: #1c7ed6; box-shadow: 0 0 4px #1c7ed6; }
+    .dot-closed { background-color: #adb5bd; }
+    
+    /* 顶部时间栏 */
+    .time-bar {
+        font-size: 0.75rem; color: #999; text-align: center;
+        margin-bottom: 20px; padding: 6px; background: #fafafa; border-radius: 6px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-# --- 2. 核心数据层 (含重试机制与防崩溃逻辑) ---
-
-@st.cache_data(ttl=600)
-def get_realtime_market_data():
+# --- 2. 辅助函数：生成统一 HTML 卡片 ---
+def card_html(label, value_str, delta_str=None, delta_val=0, extra_tag=""):
     """
-    获取全市场实时行情
-    包含：重试机制(修复超时)、字段清洗(修复KeyError)、类型强制转换(修复AttributeError)
+    生成一段标准的 HTML 代码，确保所有卡片长得一样
     """
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # 尝试获取数据
-            df = ak.stock_zh_a_spot_em()
-            
-            # 定义列名映射
-            rename_dict = {
-                "代码": "symbol", "名称": "name", "最新价": "price", 
-                "涨跌幅": "change_pct", "市盈率-动态": "pe", "市净率": "pb",
-                "换手率": "turnover", "总市值": "market_cap", "所处行业": "industry",
-                "量比": "volume_ratio"
-            }
-            df = df.rename(columns=rename_dict)
-            
-            # 1. 补全可能缺失的列，区分文本和数字
-            str_cols = ['symbol', 'name', 'industry']
-            for col in rename_dict.values():
-                if col not in df.columns:
-                    df[col] = "" if col in str_cols else 0
-            
-            # 2. 强制将文本列转换为字符串 (修复 AttributeError)
-            for col in str_cols:
-                df[col] = df[col].astype(str)
+    if delta_str:
+        color_class = "color-up" if delta_val >= 0 else "color-down"
+        delta_html = f"<div class='metric-delta {color_class}'>{delta_str}</div>"
+    else:
+        delta_html = "" # 如果没有涨跌幅（比如恐慌指数），就不显示这一行
+        
+    return f"""
+    <div class="metric-card">
+        <div class="metric-label">{label} {extra_tag}</div>
+        <div class="metric-value">{value_str}</div>
+        {delta_html}
+    </div>
+    """
 
-            # 3. 强制转换数值列 (修复计算错误)
-            numeric_cols = ['price', 'change_pct', 'pe', 'pb', 'turnover', 'market_cap', 'volume_ratio']
-            for col in numeric_cols:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-                
-            return df
-            
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(2) # 失败等待2秒后重试
-                continue
-            else:
-                st.error(f"行情数据获取失败 (已重试3次)，可能是东方财富接口波动或网络限制。错误信息: {e}")
-                return pd.DataFrame()
-    return pd.DataFrame()
+# --- 3. 状态管理 ---
+if 'data_cache' not in st.session_state:
+    st.session_state['data_cache'] = None
+if st.session_state['data_cache'] and 'model' not in st.session_state['data_cache']:
+    st.session_state['data_cache'] = None # 缓存清洗
 
-@st.cache_data(ttl=1800)
-def get_stock_history(symbol, days=365):
-    """获取个股历史K线 (用于技术分析与回测)"""
+st.markdown("### ⚡ BTDR 领航员 v7.4")
+
+# --- 4. UI 骨架 (占位符) ---
+ph_time = st.empty()
+
+# 核心指标
+c1, c2 = st.columns(2)
+with c1: ph_btc = st.empty()
+with c2: ph_fng = st.empty()
+
+st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
+st.caption("⚒️ 矿股板块 Beta")
+cols = st.columns(5)
+ph_peers = [col.empty() for col in cols]
+
+st.markdown("---")
+
+c3, c4 = st.columns(2)
+with c3: ph_btdr_price = st.empty()
+with c4: ph_btdr_open = st.empty()
+
+st.markdown("### 🎯 AI 托管预测")
+col_h, col_l = st.columns(2)
+with col_h: ph_pred_high = st.empty()
+with col_l: ph_pred_low = st.empty()
+
+st.markdown("---")
+ph_footer = st.empty()
+
+# --- 5. 核心逻辑：AI 调参 ---
+@st.cache_data(ttl=3600)
+def auto_tune_model():
+    default_model = {
+        "high": {"intercept": 4.29, "beta_open": 0.67, "beta_btc": 0.52},
+        "low":  {"intercept": -3.22, "beta_open": 0.88, "beta_btc": 0.42},
+        "beta_sector": 0.25
+    }
     try:
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y%m%d")
-        end_date = datetime.datetime.now().strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
-        if df.empty: return pd.DataFrame()
+        df = yf.download("BTDR", period="1mo", interval="1d", progress=False)
+        if len(df) < 10: return default_model, "数据不足"
+        if isinstance(df.columns, pd.MultiIndex): df = df.xs('BTDR', axis=1, level=1)
+        df = df.dropna()
+        df['PrevClose'] = df['Close'].shift(1)
+        df = df.dropna()
         
-        df = df.rename(columns={"日期": "date", "开盘": "open", "收盘": "close", "最高": "high", "最低": "low", "成交量": "volume"})
-        df['date'] = pd.to_datetime(df['date'])
-        return df
-    except:
-        return pd.DataFrame()
-
-# --- 3. 策略与计算引擎 ---
-
-def calculate_indicators(df):
-    """计算 MACD, RSI"""
-    if df.empty: return df
-    
-    # MA
-    df['MA5'] = df['close'].rolling(5).mean()
-    df['MA20'] = df['close'].rolling(20).mean()
-    
-    # MACD
-    exp12 = df['close'].ewm(span=12, adjust=False).mean()
-    exp26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['DIF'] = exp12 - exp26
-    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
-    df['MACD'] = 2 * (df['DIF'] - df['DEA'])
-    
-    # RSI (14)
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    return df
-
-def run_simple_backtest(df):
-    """简易回测：双均线策略"""
-    if df.empty: return 0, pd.DataFrame()
-    
-    df['signal'] = np.where(df['MA5'] > df['MA20'], 1, 0)
-    df['pct_change'] = df['close'].pct_change()
-    df['strategy_return'] = df['pct_change'] * df['signal'].shift(1)
-    
-    df['cum_return'] = (1 + df['strategy_return']).cumprod()
-    df['benchmark'] = (1 + df['pct_change']).cumprod()
-    
-    total_return = (df['cum_return'].iloc[-1] - 1) * 100 if not df['cum_return'].isnull().all() else 0
-    return total_return, df
-
-def ai_diagnosis(row, hist_df):
-    """五维诊断模型"""
-    scores = {}
-    
-    pe = row['pe']
-    scores['估值'] = 100 - min(pe, 100) if pe > 0 else 40
-    
-    if not hist_df.empty:
-        curr = hist_df.iloc[-1]
-        trend_score = 50
-        if curr['close'] > curr['MA20']: trend_score += 20
-        if curr['MA5'] > curr['MA20']: trend_score += 30
-        scores['趋势'] = trend_score
-    else:
-        scores['趋势'] = 0
+        x = ((df['Open'] - df['PrevClose']) / df['PrevClose'] * 100).values
+        y_high = ((df['High'] - df['PrevClose']) / df['PrevClose'] * 100).values
+        y_low = ((df['Low'] - df['PrevClose']) / df['PrevClose'] * 100).values
         
-    to = row.get('turnover', 0)
-    scores['资金'] = min(to * 10, 100)
-    
-    if not hist_df.empty and 'RSI' in hist_df.columns:
-        rsi = hist_df.iloc[-1]['RSI'] if not pd.isna(hist_df.iloc[-1]['RSI']) else 50
-        scores['动量'] = 100 - abs(50 - rsi) * 2 
-    else:
-        scores['动量'] = 50
+        cov_h = np.cov(x, y_high); beta_h = cov_h[0, 1] / cov_h[0, 0] if cov_h[0, 0] != 0 else 0.67
+        cov_l = np.cov(x, y_low); beta_l = cov_l[0, 1] / cov_l[0, 0] if cov_l[0, 0] != 0 else 0.88
         
-    pct = row['change_pct']
-    scores['情绪'] = 50 + pct * 5 
-    
-    total_score = sum(scores.values()) / 5
-    return total_score, scores
-
-# --- 4. 界面交互逻辑 ---
-
-# Sidebar
-with st.sidebar:
-    st.title("🎛️ 控制面板")
-    mode = st.radio("使用模式", ["新手模式 (开箱即用)", "专业模式 (自定义参数)"])
-    st.markdown("---")
-    if mode == "专业模式 (自定义参数)":
-        pe_range = st.slider("PE范围", 0, 200, (0, 60))
-        min_mkt_cap = st.number_input("最小市值(亿)", 0, 1000, 50)
-        show_backtest = st.checkbox("显示回测详情", True)
-    else:
-        pe_range = (0, 80)
-        min_mkt_cap = 20
-        show_backtest = False
-        st.info("💡 新手模式：已自动过滤高风险股，隐藏复杂参数。")
-
-# Main Area
-st.title("🚀 A股智能量化决策系统")
-st.markdown("功能全覆盖：**选股 + 诊断 + 回测 + 导出** | 数据源：**Akshare (无Token)**")
-
-# 1. 行业扫描
-st.subheader("1. 热门赛道扫描")
-col1, col2, col3, col4, col5 = st.columns(5)
-sectors = {"新能源": ["光伏", "锂", "能", "隆基"], 
-           "半导体": ["芯", "微", "韦尔", "紫光"], 
-           "消费": ["酒", "乳", "免税", "茅台"], 
-           "数字经济": ["软件", "云", "算力", "浪潮"],
-           "医药": ["药", "医", "恒瑞", "迈瑞"]}
-
-if 'sector' not in st.session_state: st.session_state.sector = "新能源"
-
-for i, (name, kw) in enumerate(sectors.items()):
-    with [col1, col2, col3, col4, col5][i]:
-        if st.button(f"{name}", use_container_width=True):
-            st.session_state.sector = name
-
-# 执行筛选
-all_data = get_realtime_market_data()
-
-if not all_data.empty:
-    keywords = sectors[st.session_state.sector]
-    
-    # 稳健的字符串筛选逻辑 (修复 AttributeError)
-    mask_name = all_data['name'].str.contains('|'.join(keywords), na=False)
-    mask_ind = all_data['industry'].str.contains(st.session_state.sector, na=False)
-    
-    df_sector = all_data[mask_name | mask_ind].copy()
-    
-    # 过滤与排序
-    df_final = df_sector[
-        (df_sector['pe'] >= pe_range[0]) & 
-        (df_sector['pe'] <= pe_range[1]) &
-        (df_sector['market_cap'] > min_mkt_cap * 100000000)
-    ].sort_values('change_pct', ascending=False).head(10)
-    
-    st.subheader(f"2. {st.session_state.sector} 精选结果与 AI 诊断")
-    
-    # 导出
-    csv = df_final.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 导出当前结果", csv, "stock_results.csv", "text/csv")
-    
-    if df_final.empty:
-        st.warning("当前筛选条件下无结果，请尝试切换行业或在专业模式调整参数。")
-    
-    for idx, row in df_final.iterrows():
-        hist_df = get_stock_history(row['symbol'])
-        hist_df = calculate_indicators(hist_df)
-        score, dimensions = ai_diagnosis(row, hist_df)
+        beta_h = np.clip(beta_h, 0.3, 1.2)
+        beta_l = np.clip(beta_l, 0.4, 1.5)
+        intercept_h = np.mean(y_high) - beta_h * np.mean(x)
+        intercept_l = np.mean(y_low) - beta_l * np.mean(x)
         
-        risk_level = "高" if score < 40 else ("中" if score < 70 else "低")
-        risk_color = "red" if risk_level == "高" else ("orange" if risk_level == "中" else "green")
-        
-        with st.expander(f"{row['name']} ({row['symbol']}) | 评分: {score:.0f} | 风险: {risk_level}", expanded=False):
-            c1, c2, c3 = st.columns([1.5, 1.5, 1])
+        final_model = {
+            "high": {"intercept": 0.7*4.29 + 0.3*intercept_h, "beta_open": 0.7*0.67 + 0.3*beta_h, "beta_btc": 0.52},
+            "low": {"intercept": 0.7*-3.22 + 0.3*intercept_l, "beta_open": 0.7*0.88 + 0.3*beta_l, "beta_btc": 0.42},
+            "beta_sector": 0.25
+        }
+        return final_model, "已自适应"
+    except: return default_model, "默认参数"
+
+# --- 6. 渲染函数 (UI 统一化) ---
+def render_ui(data):
+    if not data: return
+    if 'model' not in data: return 
+    
+    quotes = data['quotes']
+    fng_val = data['fng']
+    model_params = data['model']
+    model_status = data['model_status']
+    
+    btc_chg = quotes['BTC-USD']['pct']
+    btdr = quotes['BTDR']
+    
+    # 时间
+    tz_bj = pytz.timezone('Asia/Shanghai')
+    tz_ny = pytz.timezone('America/New_York')
+    now_bj = datetime.now(tz_bj).strftime('%H:%M:%S')
+    now_ny = datetime.now(tz_ny).strftime('%H:%M:%S')
+    ph_time.markdown(f"<div class='time-bar'>北京 {now_bj} &nbsp;|&nbsp; 美东 {now_ny} &nbsp;|&nbsp; AI {model_status}</div>", unsafe_allow_html=True)
+    
+    # --- 1. 核心指标 (使用统一 HTML) ---
+    ph_btc.markdown(card_html("BTC (全时段)", f"{btc_chg:+.2f}%", f"{btc_chg:+.2f}%", btc_chg), unsafe_allow_html=True)
+    # 恐慌指数没有涨跌幅，只显示数值
+    ph_fng.markdown(card_html("恐慌指数", f"{fng_val}", None, 0), unsafe_allow_html=True)
+    
+    # --- 2. 板块 (使用统一 HTML) ---
+    peers = ["MARA", "RIOT", "CORZ", "CLSK", "IREN"]
+    for i, p in enumerate(peers):
+        if p in quotes:
+            val = quotes[p]['pct']
+            ph_peers[i].markdown(card_html(p, f"{val:+.1f}%", f"{val:+.1f}%", val), unsafe_allow_html=True)
             
-            with c1:
-                st.markdown("#### 🔍 核心数据")
-                st.write(f"**最新价**: {row['price']} (涨幅 {row['change_pct']}%)")
-                st.write(f"**PE(动)**: {row['pe']} | **PB**: {row['pb']}")
-                st.write(f"**换手率**: {row['turnover']}% | **量比**: {row['volume_ratio']}")
+    # --- 3. 预测计算 ---
+    valid_peers = [p for p in peers if quotes[p]['price'] > 0]
+    peers_avg = sum(quotes[p]['pct'] for p in valid_peers) / len(valid_peers) if valid_peers else 0
+    sector_alpha = peers_avg - btc_chg
+    sentiment_adj = (fng_val - 50) * 0.02
+    
+    pred_high_price, pred_low_price, pred_high_pct, pred_low_pct, btdr_open_pct = 0,0,0,0,0
+    
+    if btdr['price'] > 0:
+        btdr_open_pct = ((btdr['open'] - btdr['prev']) / btdr['prev']) * 100
+        MODEL = model_params
+        pred_high_pct = (MODEL['high']['intercept'] + (MODEL['high']['beta_open'] * btdr_open_pct) + (MODEL['high']['beta_btc'] * btc_chg) + (MODEL['beta_sector'] * sector_alpha) + sentiment_adj)
+        pred_low_pct = (MODEL['low']['intercept'] + (MODEL['low']['beta_open'] * btdr_open_pct) + (MODEL['low']['beta_btc'] * btc_chg) + (MODEL['beta_sector'] * sector_alpha) + sentiment_adj)
+        pred_high_price = btdr['prev'] * (1 + pred_high_pct / 100)
+        pred_low_price = btdr['prev'] * (1 + pred_low_pct / 100)
+
+    # --- 4. BTDR 本体 (使用统一 HTML) ---
+    state_map = {"PRE": "dot-pre", "REG": "dot-reg", "POST": "dot-post", "CLOSED": "dot-closed"}
+    dot_class = state_map.get(btdr.get('tag', 'CLOSED'), 'dot-closed')
+    status_tag = f"<span class='status-dot {dot_class}'></span> <span style='margin-left:2px; font-size:0.7rem;'>{btdr.get('tag', 'CLOSED')}</span>"
+    
+    ph_btdr_price.markdown(card_html("BTDR 实时", f"${btdr['price']:.2f}", f"{btdr['pct']:+.2f}%", btdr['pct'], status_tag), unsafe_allow_html=True)
+    
+    # 这里的"计算用开盘"也换成了统一大字号卡片
+    ph_btdr_open.markdown(card_html("计算用开盘", f"${btdr['open']:.2f}", f"{btdr_open_pct:+.2f}%", btdr_open_pct), unsafe_allow_html=True)
+    
+    # --- 5. 预测框 ---
+    h_bg = "#e6fcf5" if btdr['price'] < pred_high_price else "#0ca678"; h_txt = "#087f5b" if btdr['price'] < pred_high_price else "#ffffff"
+    l_bg = "#fff5f5" if btdr['price'] > pred_low_price else "#e03131"; l_txt = "#c92a2a" if btdr['price'] > pred_low_price else "#ffffff"
+
+    ph_pred_high.markdown(f"""
+    <div class="pred-container-wrapper">
+        <div class="pred-box" style="background-color: {h_bg}; color: {h_txt}; border: 1px solid #c3fae8;">
+            <div style="font-size: 0.8rem; opacity: 0.8;">阻力位 (High)</div>
+            <div style="font-size: 1.5rem; font-weight: bold;">${pred_high_price:.2f}</div>
+            <div style="font-size: 0.75rem; opacity: 0.9;">预期: {pred_high_pct:+.2f}%</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    ph_pred_low.markdown(f"""
+    <div class="pred-container-wrapper">
+        <div class="pred-box" style="background-color: {l_bg}; color: {l_txt}; border: 1px solid #ffc9c9;">
+            <div style="font-size: 0.8rem; opacity: 0.8;">支撑位 (Low)</div>
+            <div style="font-size: 1.5rem; font-weight: bold;">${pred_low_price:.2f}</div>
+            <div style="font-size: 0.75rem; opacity: 0.9;">预期: {pred_low_pct:+.2f}%</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    ph_footer.caption(f"Update: {now_ny} ET | Auto-Tuned by AI")
+
+# --- 7. 数据获取 ---
+@st.cache_data(ttl=5)
+def get_data_v74():
+    tickers_list = "BTC-USD BTDR MARA RIOT CORZ CLSK IREN"
+    try:
+        daily = yf.download(tickers_list, period="5d", interval="1d", group_by='ticker', threads=True, progress=False)
+        live = yf.download(tickers_list, period="1d", interval="1m", prepost=True, group_by='ticker', threads=True, progress=False)
+        quotes = {}
+        symbols = tickers_list.split()
+        today_ny = datetime.now(pytz.timezone('America/New_York')).date()
+        
+        for sym in symbols:
+            try:
+                df_day = daily[sym] if sym in daily else pd.DataFrame()
+                if not df_day.empty: df_day = df_day.dropna(subset=['Close'])
+                df_min = live[sym] if sym in live else pd.DataFrame()
+                if not df_min.empty: df_min = df_min.dropna(subset=['Close'])
                 
-                advice = "观望"
-                if score > 75 and row['change_pct'] < 5: advice = "建议关注 (优质且未暴涨)"
-                elif score > 60: advice = "持有/观察"
-                elif score < 40: advice = "回避/卖出"
-                st.info(f"💡 **AI 建议**: {advice}")
-
-            with c2:
-                st.markdown("#### 🕸️ 多维诊断")
-                radar_data = pd.DataFrame(dict(r=list(dimensions.values()), theta=list(dimensions.keys())))
-                fig_radar = px.line_polar(radar_data, r='r', theta='theta', line_close=True)
-                fig_radar.update_traces(fill='toself')
-                fig_radar.update_layout(height=200, margin=dict(t=0, b=0, l=0, r=0))
-                st.plotly_chart(fig_radar, use_container_width=True)
+                # 实时价
+                state = "REG" if not df_min.empty else "CLOSED"
+                current_price = df_min['Close'].iloc[-1] if not df_min.empty else (df_day['Close'].iloc[-1] if not df_day.empty else 0)
                 
-            with c3:
-                if not hist_df.empty:
-                    ret, res_df = run_simple_backtest(hist_df)
-                    st.markdown("#### 🔙 历史回测 (1年)")
-                    st.metric("双均线策略收益", f"{ret:.1f}%", delta=f"{ret - (hist_df['close'].iloc[-1]/hist_df['close'].iloc[0]-1)*100:.1f}% vs 基准")
-                    st.line_chart(res_df[['cum_return', 'benchmark']], height=150)
-            
-            if mode == "专业模式 (自定义参数)" or show_backtest:
-                st.markdown("#### 📈 技术走势 (含 MACD/RSI)")
-                if not hist_df.empty:
-                    fig_k = go.Figure()
-                    fig_k.add_trace(go.Candlestick(x=hist_df['date'], open=hist_df['open'], high=hist_df['high'], low=hist_df['low'], close=hist_df['close'], name='K线'))
-                    fig_k.add_trace(go.Scatter(x=hist_df['date'], y=hist_df['MA20'], line=dict(color='orange'), name='MA20'))
-                    fig_k.update_layout(height=350, xaxis_rangeslider_visible=False)
-                    st.plotly_chart(fig_k, use_container_width=True)
+                # 昨收
+                prev_close = 1.0
+                if not df_day.empty:
+                    last_date = df_day.index[-1].date()
+                    if last_date == today_ny:
+                        if len(df_day) >= 2: prev_close = df_day['Close'].iloc[-2]
+                        elif not df_day.empty: prev_close = df_day['Open'].iloc[-1]
+                    else: prev_close = df_day['Close'].iloc[-1]
+                
+                pct = ((current_price - prev_close) / prev_close) * 100 if prev_close > 0 else 0
+                open_price = df_day['Open'].iloc[-1] if not df_day.empty and df_day.index[-1].date() == today_ny else current_price
+                quotes[sym] = {"price": current_price, "pct": pct, "prev": prev_close, "open": open_price, "tag": state}
+            except: quotes[sym] = {"price": 0, "pct": 0, "prev": 0, "open": 0, "tag": "ERR"}
+        return quotes
+    except: return None
 
-else:
-    # 只有当3次重试都失败后，才会显示这个
-    pass
+# --- 8. 执行流 ---
+if st.session_state['data_cache']: render_ui(st.session_state['data_cache'])
+else: ph_time.info("📡 正在统一视觉系统...")
 
-if 'first_visit' not in st.session_state:
-    st.toast("🔰 新手模式已开启：只显示最核心的选股结果与建议！")
-    st.session_state.first_visit = False
+new_quotes = get_data_v74()
+ai_model, ai_status = auto_tune_model()
+
+if new_quotes:
+    try: fng = int(requests.get("https://api.alternative.me/fng/", timeout=1).json()['data'][0]['value'])
+    except: fng = 50
+    st.session_state['data_cache'] = {'quotes': new_quotes, 'fng': fng, 'model': ai_model, 'model_status': ai_status}
+    render_ui(st.session_state['data_cache'])
