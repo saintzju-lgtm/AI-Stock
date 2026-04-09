@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
 
-# --- 0. 授权验证 (保持不变) ---
+# --- 0. 授权验证 ---
 def check_password():
     if "password_correct" not in st.session_state:
         st.session_state.password_correct = False
@@ -26,23 +26,30 @@ def check_password():
         return False
     return True
 
-# --- 1. 核心量化引擎 ---
+# --- 1. 增强版量化引擎 ---
 @st.cache_data(ttl=3600)
-def get_pro_market_data():
+def get_enhanced_market_data():
     try:
-        time.sleep(1.5) # 抗封锁冷却
+        time.sleep(1.5) 
         tk = yf.Ticker("BTDR")
         info = tk.info
         hist = tk.history(period="100d", interval="1d")
         if hist.empty: return None
 
-        # 1. 市场锚点 (BTC & 纳指)
+        # 1. 抓取宏观与锚点数据
         btc = yf.Ticker("BTC-USD").fast_info['last_price']
+        
         nas_tk = yf.Ticker("^IXIC")
         nasdaq = nas_tk.fast_info['last_price']
         nasdaq_pct = (nasdaq / nas_tk.fast_info['previous_close'] - 1)
+        
+        # 新增：VIX 恐慌指数
+        vix_tk = yf.Ticker("^VIX")
+        vix = vix_tk.fast_info['last_price']
+        vix_prev = vix_tk.fast_info['previous_close']
+        vix_pct = (vix / vix_prev - 1)
 
-        # 2. 期权链处理 (ATM 附近切片)
+        # 2. 期权链处理 (ATM 切片)
         exp_dates = tk.options
         calls_df = pd.DataFrame()
         current_exp = "N/A"
@@ -52,19 +59,17 @@ def get_pro_market_data():
             try:
                 opt_data = tk.option_chain(current_exp)
                 all_calls = opt_data.calls
-                
-                # 平值期权中心化切片逻辑
                 atm_idx = (all_calls['strike'] - curr_p).abs().idxmin()
                 start_idx = max(0, atm_idx - 4)
                 end_idx = min(len(all_calls), atm_idx + 5)
                 calls_df = all_calls.iloc[start_idx:end_idx]
             except: pass
 
-        # 3. 基础指标计算
+        # 3. 基础处理与指标计算
         current_float = info.get('floatShares') or info.get('shares') or 118500000
         rt_v = info.get('regularMarketVolume', 0)
         
-        hist.index = hist.index.date # 日期简化
+        hist.index = hist.index.date
         hist['昨收'] = hist['Close'].shift(1)
         hist['MA5'] = hist['Close'].rolling(5).mean()
         hist['MA20'] = hist['Close'].rolling(20).mean()
@@ -80,12 +85,12 @@ def get_pro_market_data():
         mfr = pd.Series(pos_flow).rolling(14).sum() / pd.Series(neg_flow).rolling(14).sum()
         hist['MFI'] = 100 - (100 / (1 + mfr.values))
 
-        # 4. 暗池/大宗交易打印模拟 (成交量偏离均值 1.2倍)
+        # 4. 暗池/大宗打印 (1.2倍偏离识别)
         avg_vol = hist['Volume'].mean()
         dark_prints = hist[hist['Volume'] > avg_vol * 1.2].tail(8).copy()
         dark_prints['Signal'] = dark_prints.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
 
-        # 5. 场景回归模型
+        # 5. 回归模型
         hist['今开比例'] = (hist['Open'] - hist['昨收']) / hist['昨收']
         fit_df = hist.dropna()
         X = fit_df[['今开比例']].values
@@ -95,6 +100,7 @@ def get_pro_market_data():
 
         return hist, reg_params, calls_df, dark_prints, {
             'btc': btc, 'nasdaq': nasdaq, 'nasdaq_pct': nasdaq_pct, 
+            'vix': vix, 'vix_pct': vix_pct,
             'float': current_float, 'volume': rt_v, 'exp': current_exp
         }
     except:
@@ -102,25 +108,30 @@ def get_pro_market_data():
 
 # --- 2. UI 渲染 ---
 if check_password():
-    st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; padding-bottom: 5px; } div.stButton > button { font-weight: bold; border: 1px solid #1A237E; } </style>""", unsafe_allow_html=True)
+    st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; padding-bottom: 5px; } </style>""", unsafe_allow_html=True)
 
-    data = get_pro_market_data()
+    data = get_enhanced_market_data()
     
     if data:
         hist_df, reg, calls_df, dark_df, mkt = data
         last_h = hist_df.iloc[-1]
         curr_p = last_h['Close']
 
-        # 看板
-        m1, m2, m3 = st.columns(3)
+        # --- 顶部宏观看板 (四列布局) ---
+        st.subheader("🌐 全球市场与宏观防御")
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Bitcoin (BTC)", f"${mkt['btc']:,.0f}")
         m2.metric("Nasdaq Index", f"{mkt['nasdaq']:,.2f}", f"{mkt['nasdaq_pct']:.2%}")
-        m3.metric("BTDR 现价", f"${curr_p:.2f}", f"{(curr_p/last_h['昨收']-1):.2%}")
+        # VIX 颜色逻辑：VIX 上涨通常代表负面，但在 metric 中颜色随数值变化
+        m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}", f"{mkt['vix_pct']:.2%}", delta_color="inverse")
+        m4.metric("BTDR 现价", f"${curr_p:.2f}", f"{(curr_p/last_h['昨收']-1):.2%}")
 
-        # 指标与回归
+        st.divider()
+
+        # 看板与回归
         c1, c2 = st.columns([1, 1.5])
         with c1:
-            st.subheader("📊 实时状态看板")
+            st.subheader("📊 实时看板")
             st.write(f"实时换手: **{(mkt['volume']/mkt['float'])*100:.2f}%**")
             st.write(f"BOLL 高/低: **{last_h['Upper']:.2f} / {last_h['Lower']:.2f}**")
             st.write(f"资金 MFI: **{last_h['MFI']:.2f}**")
@@ -131,33 +142,28 @@ if check_password():
             p_l = last_h['昨收'] * (1 + (reg['inter_l'] + reg['slope_l'] * ratio_o))
             st.table(pd.DataFrame({
                 "场景": ["看空失效", "中性回归", "支撑测试"],
-                "压力位参考": [p_h*1.06, p_h, p_h*0.94],
-                "支撑位参考": [p_l*1.06, p_l, p_l*0.94]
+                "压力参考": [p_h*1.06, p_h, p_h*0.94],
+                "支撑参考": [p_l*1.06, p_l, p_l*0.94]
             }).style.format(precision=2))
 
         # 走势主图
         st.divider()
-        st.subheader("🕒 走势主图 (图例集成实时数值)")
         fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
         p_df = hist_df.tail(40).copy()
         
-        # BOLL 轨道
         fig_k.add_trace(go.Scatter(x=p_df.index, y=p_df['Upper'], line=dict(color='rgba(0,102,204,0.5)', width=1.5), name=f"BOLL High: {last_h['Upper']:.2f}"), row=1, col=1)
         fig_k.add_trace(go.Scatter(x=p_df.index, y=p_df['Lower'], line=dict(color='rgba(0,102,204,0.5)', width=1.5), fill='tonexty', fillcolor='rgba(0,102,204,0.1)', name=f"BOLL Low: {last_h['Lower']:.2f}"), row=1, col=1)
-        
-        # K线与MA5
         fig_k.add_trace(go.Candlestick(x=p_df.index, open=p_df['Open'], high=p_df['High'], low=p_df['Low'], close=p_df['Close'], name="K线"), row=1, col=1)
         fig_k.add_trace(go.Scatter(x=p_df.index, y=p_df['MA5'], name=f"MA5: {last_h['MA5']:.2f}", line=dict(color='#FF9800', width=2)), row=1, col=1)
         
-        # --- 重点修改区域：修复换手率图颜色丢失问题 ---
+        # 换手率柱状图颜色逻辑
         vol_colors = ['#E53935' if (p_df['Close'].iloc[i] >= p_df['Open'].iloc[i]) else '#43A047' for i in range(len(p_df))]
-        # 重新注入 marker_color 参数
         fig_k.add_trace(go.Bar(x=p_df.index, y=p_df['换手率_raw']*100, name="换手率%", marker_color=vol_colors), row=2, col=1)
         
         fig_k.update_layout(height=650, xaxis_rangeslider_visible=False, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         st.plotly_chart(fig_k, use_container_width=True)
 
-        # 期权链与暗池 (保持已优化的切片逻辑)
+        # 期权链与暗池
         st.divider()
         o_col, d_col = st.columns(2)
         with o_col:
@@ -181,7 +187,7 @@ if check_password():
         st.subheader("📋 历史明细 (集成 MFI)")
         hist_show = hist_df.tail(15).copy()
         hist_show['换手'] = (hist_show['换手率_raw'] * 100).map('{:.2f}%'.format)
-        st.dataframe(hist_show[['Open', 'High', 'Low', 'Close', '换手', 'MFI', 'MA20']].style.format(subset=['Open', 'High', 'Low', 'Close', 'MFI', 'MA20'], precision=2), use_container_width=True)
+        st.dataframe(hist_show[['Open', 'High', 'Low', 'Close', '换手', 'MFI', 'MA20']].style.format(precision=2), use_container_width=True)
 
     else:
-        st.error("⚠️ 数据获取失败。Yahoo 接口可能暂时封锁中，建议更换网络节点重试。")
+        st.error("⚠️ 数据加载失败。请更换 VPN 节点或等候 5 分钟重试。")
