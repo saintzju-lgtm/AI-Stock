@@ -6,6 +6,7 @@ from sklearn.linear_model import LinearRegression
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
+from datetime import datetime
 
 # --- 0. 授权验证 ---
 def check_password():
@@ -26,7 +27,7 @@ def check_password():
         return False
     return True
 
-# --- 1. 增强版量化引擎 ---
+# --- 1. 核心量化引擎 ---
 @st.cache_data(ttl=3600)
 def get_enhanced_market_data():
     try:
@@ -38,34 +39,39 @@ def get_enhanced_market_data():
 
         # 1. 抓取宏观与锚点数据
         btc = yf.Ticker("BTC-USD").fast_info['last_price']
-        
         nas_tk = yf.Ticker("^IXIC")
         nasdaq = nas_tk.fast_info['last_price']
         nasdaq_pct = (nasdaq / nas_tk.fast_info['previous_close'] - 1)
         
-        # 新增：VIX 恐慌指数
         vix_tk = yf.Ticker("^VIX")
         vix = vix_tk.fast_info['last_price']
-        vix_prev = vix_tk.fast_info['previous_close']
-        vix_pct = (vix / vix_prev - 1)
+        vix_pct = (vix / vix_tk.fast_info['previous_close'] - 1)
 
-        # 2. 期权链处理 (ATM 切片)
+        # 2. 期权链处理 (优化：自动避开到期日归零合约)
         exp_dates = tk.options
         calls_df = pd.DataFrame()
         current_exp = "N/A"
+        
         if exp_dates:
-            curr_p = hist['Close'].iloc[-1]
-            current_exp = exp_dates[0]
+            # 逻辑：如果最近的到期日是今天，则抓取下一个到期日以获得有效数据
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            if exp_dates[0] <= today_str and len(exp_dates) > 1:
+                current_exp = exp_dates[1] # 取下周或下个月
+            else:
+                current_exp = exp_dates[0]
+                
             try:
+                curr_p = hist['Close'].iloc[-1]
                 opt_data = tk.option_chain(current_exp)
                 all_calls = opt_data.calls
+                # ATM 中心化切片
                 atm_idx = (all_calls['strike'] - curr_p).abs().idxmin()
                 start_idx = max(0, atm_idx - 4)
                 end_idx = min(len(all_calls), atm_idx + 5)
                 calls_df = all_calls.iloc[start_idx:end_idx]
             except: pass
 
-        # 3. 基础处理与指标计算
+        # 3. 基础指标计算
         current_float = info.get('floatShares') or info.get('shares') or 118500000
         rt_v = info.get('regularMarketVolume', 0)
         
@@ -85,12 +91,12 @@ def get_enhanced_market_data():
         mfr = pd.Series(pos_flow).rolling(14).sum() / pd.Series(neg_flow).rolling(14).sum()
         hist['MFI'] = 100 - (100 / (1 + mfr.values))
 
-        # 4. 暗池/大宗打印 (1.2倍偏离识别)
+        # 4. 暗池/大宗打印 (1.2倍偏离)
         avg_vol = hist['Volume'].mean()
         dark_prints = hist[hist['Volume'] > avg_vol * 1.2].tail(8).copy()
         dark_prints['Signal'] = dark_prints.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
 
-        # 5. 回归模型
+        # 5. 场景回归模型
         hist['今开比例'] = (hist['Open'] - hist['昨收']) / hist['昨收']
         fit_df = hist.dropna()
         X = fit_df[['今开比例']].values
@@ -117,12 +123,11 @@ if check_password():
         last_h = hist_df.iloc[-1]
         curr_p = last_h['Close']
 
-        # --- 顶部宏观看板 (四列布局) ---
-        st.subheader("🌐 全球市场与宏观防御")
+        # 🌐 全球市场锚点
+        st.subheader("🌐 宏观风险防御看板")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Bitcoin (BTC)", f"${mkt['btc']:,.0f}")
         m2.metric("Nasdaq Index", f"{mkt['nasdaq']:,.2f}", f"{mkt['nasdaq_pct']:.2%}")
-        # VIX 颜色逻辑：VIX 上涨通常代表负面，但在 metric 中颜色随数值变化
         m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}", f"{mkt['vix_pct']:.2%}", delta_color="inverse")
         m4.metric("BTDR 现价", f"${curr_p:.2f}", f"{(curr_p/last_h['昨收']-1):.2%}")
 
@@ -131,7 +136,7 @@ if check_password():
         # 看板与回归
         c1, c2 = st.columns([1, 1.5])
         with c1:
-            st.subheader("📊 实时看板")
+            st.subheader("📊 实时指标")
             st.write(f"实时换手: **{(mkt['volume']/mkt['float'])*100:.2f}%**")
             st.write(f"BOLL 高/低: **{last_h['Upper']:.2f} / {last_h['Lower']:.2f}**")
             st.write(f"资金 MFI: **{last_h['MFI']:.2f}**")
@@ -140,34 +145,27 @@ if check_password():
             ratio_o = (last_h['Open'] - last_h['昨收']) / last_h['昨收']
             p_h = last_h['昨收'] * (1 + (reg['inter_h'] + reg['slope_h'] * ratio_o))
             p_l = last_h['昨收'] * (1 + (reg['inter_l'] + reg['slope_l'] * ratio_o))
-            st.table(pd.DataFrame({
-                "场景": ["看空失效", "中性回归", "支撑测试"],
-                "压力参考": [p_h*1.06, p_h, p_h*0.94],
-                "支撑参考": [p_l*1.06, p_l, p_l*0.94]
-            }).style.format(precision=2))
+            st.table(pd.DataFrame({"场景": ["看空失效", "中性回归", "支撑测试"], "压力参考": [p_h*1.06, p_h, p_h*0.94], "支撑参考": [p_l*1.06, p_l, p_l*0.94]}).style.format(precision=2))
 
         # 走势主图
         st.divider()
         fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
         p_df = hist_df.tail(40).copy()
-        
         fig_k.add_trace(go.Scatter(x=p_df.index, y=p_df['Upper'], line=dict(color='rgba(0,102,204,0.5)', width=1.5), name=f"BOLL High: {last_h['Upper']:.2f}"), row=1, col=1)
         fig_k.add_trace(go.Scatter(x=p_df.index, y=p_df['Lower'], line=dict(color='rgba(0,102,204,0.5)', width=1.5), fill='tonexty', fillcolor='rgba(0,102,204,0.1)', name=f"BOLL Low: {last_h['Lower']:.2f}"), row=1, col=1)
         fig_k.add_trace(go.Candlestick(x=p_df.index, open=p_df['Open'], high=p_df['High'], low=p_df['Low'], close=p_df['Close'], name="K线"), row=1, col=1)
         fig_k.add_trace(go.Scatter(x=p_df.index, y=p_df['MA5'], name=f"MA5: {last_h['MA5']:.2f}", line=dict(color='#FF9800', width=2)), row=1, col=1)
         
-        # 换手率柱状图颜色逻辑
         vol_colors = ['#E53935' if (p_df['Close'].iloc[i] >= p_df['Open'].iloc[i]) else '#43A047' for i in range(len(p_df))]
         fig_k.add_trace(go.Bar(x=p_df.index, y=p_df['换手率_raw']*100, name="换手率%", marker_color=vol_colors), row=2, col=1)
-        
         fig_k.update_layout(height=650, xaxis_rangeslider_visible=False, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         st.plotly_chart(fig_k, use_container_width=True)
 
-        # 期权链与暗池
+        # 期权链与暗池 (显示非归零合约)
         st.divider()
         o_col, d_col = st.columns(2)
         with o_col:
-            st.subheader(f"🕯️ ATM期权链 (到期: {mkt['exp']})")
+            st.subheader(f"🕯️ 活跃期权链 (到期: {mkt['exp']})")
             if not calls_df.empty:
                 display_calls = calls_df[['strike', 'lastPrice', 'openInterest', 'impliedVolatility']]
                 display_calls.columns = ['行权价', '最新价', '未平仓', '隐波']
@@ -190,4 +188,4 @@ if check_password():
         st.dataframe(hist_show[['Open', 'High', 'Low', 'Close', '换手', 'MFI', 'MA20']].style.format(precision=2), use_container_width=True)
 
     else:
-        st.error("⚠️ 数据加载失败。请更换 VPN 节点或等候 5 分钟重试。")
+        st.error("⚠️ 数据加载失败。请更换 VPN 节点或刷新页面。")
