@@ -157,7 +157,7 @@ if check_password():
         fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
         p_df = hist_df.tail(40).copy()
         
-        # 重点优化：将日期强制格式化为文本，避免图表自动产生周末空档
+        # 将日期强制格式化为文本，避免图表自动产生周末空档
         p_df['label'] = pd.to_datetime(p_df.index).strftime('%m-%d')
         
         # BOLL 线
@@ -174,12 +174,12 @@ if check_password():
         
         fig_k.update_layout(height=650, xaxis_rangeslider_visible=False, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         
-        # 重点优化：强制 X 轴为分类轴，每2天显示一个刻度，倾斜45度防拥挤
+        # 重点修改区域：强制 X 轴为分类轴，每 1 天显示一个刻度，倾斜 90 度防拥挤
         fig_k.update_xaxes(
             type='category', 
             tickmode='linear', 
-            dtick=2, 
-            tickangle=-45
+            dtick=1, 
+            tickangle=-90
         )
 
         st.plotly_chart(fig_k, use_container_width=True)
