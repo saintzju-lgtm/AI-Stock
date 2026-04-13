@@ -17,7 +17,7 @@ def check_password():
         st.title("🎯 BTDR 专业量化决策终端")
         pwd = st.text_input("输入访问码", type="password")
         if st.button("进入系统"):
-            if pwd == st.secrets.get("ACCESS_PASSWORD", "123456"):
+            if pwd == st.secrets.get("ACCESS_PASSWORD", "657206"):
                 st.session_state.password_correct = True
                 st.rerun()
             else:
