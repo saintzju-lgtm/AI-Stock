@@ -157,19 +157,31 @@ if check_password():
         fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
         p_df = hist_df.tail(40).copy()
         
+        # 重点优化：将日期强制格式化为文本，避免图表自动产生周末空档
+        p_df['label'] = pd.to_datetime(p_df.index).strftime('%m-%d')
+        
         # BOLL 线
-        fig_k.add_trace(go.Scatter(x=p_df.index, y=p_df['Upper'], line=dict(color='rgba(0,102,204,0.5)', width=1.5), name=f"BOLL High: {last_h['Upper']:.2f}"), row=1, col=1)
-        fig_k.add_trace(go.Scatter(x=p_df.index, y=p_df['Lower'], line=dict(color='rgba(0,102,204,0.5)', width=1.5), fill='tonexty', fillcolor='rgba(0,102,204,0.1)', name=f"BOLL Low: {last_h['Lower']:.2f}"), row=1, col=1)
+        fig_k.add_trace(go.Scatter(x=p_df['label'], y=p_df['Upper'], line=dict(color='rgba(0,102,204,0.5)', width=1.5), name=f"BOLL High: {last_h['Upper']:.2f}"), row=1, col=1)
+        fig_k.add_trace(go.Scatter(x=p_df['label'], y=p_df['Lower'], line=dict(color='rgba(0,102,204,0.5)', width=1.5), fill='tonexty', fillcolor='rgba(0,102,204,0.1)', name=f"BOLL Low: {last_h['Lower']:.2f}"), row=1, col=1)
         
         # K线与MA5
-        fig_k.add_trace(go.Candlestick(x=p_df.index, open=p_df['Open'], high=p_df['High'], low=p_df['Low'], close=p_df['Close'], name="K线"), row=1, col=1)
-        fig_k.add_trace(go.Scatter(x=p_df.index, y=p_df['MA5'], name=f"MA5: {last_h['MA5']:.2f}", line=dict(color='#FF9800', width=2)), row=1, col=1)
+        fig_k.add_trace(go.Candlestick(x=p_df['label'], open=p_df['Open'], high=p_df['High'], low=p_df['Low'], close=p_df['Close'], name="K线"), row=1, col=1)
+        fig_k.add_trace(go.Scatter(x=p_df['label'], y=p_df['MA5'], name=f"MA5: {last_h['MA5']:.2f}", line=dict(color='#FF9800', width=2)), row=1, col=1)
         
         # 换手柱红绿配色
         vol_colors = ['#E53935' if (p_df['Close'].iloc[i] >= p_df['Open'].iloc[i]) else '#43A047' for i in range(len(p_df))]
-        fig_k.add_trace(go.Bar(x=p_df.index, y=p_df['换手率_raw']*100, name="换手率%", marker_color=vol_colors), row=2, col=1)
+        fig_k.add_trace(go.Bar(x=p_df['label'], y=p_df['换手率_raw']*100, name="换手率%", marker_color=vol_colors), row=2, col=1)
         
         fig_k.update_layout(height=650, xaxis_rangeslider_visible=False, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        
+        # 重点优化：强制 X 轴为分类轴，每2天显示一个刻度，倾斜45度防拥挤
+        fig_k.update_xaxes(
+            type='category', 
+            tickmode='linear', 
+            dtick=2, 
+            tickangle=-45
+        )
+
         st.plotly_chart(fig_k, use_container_width=True)
 
         # --- 第四阶段：期权与大宗 ---
@@ -180,7 +192,6 @@ if check_password():
             if not calls_df.empty:
                 display_calls = calls_df[['strike', 'lastPrice', 'openInterest', 'impliedVolatility']].copy()
                 display_calls.columns = ['行权价', '最新价', '未平仓', '隐波']
-                # 加入格式化，整数化显示持仓量，避免科学计数或误导
                 st.dataframe(display_calls.style.format({
                     '隐波': '{:.2%}', 
                     '最新价': '{:.2f}', 
@@ -199,12 +210,11 @@ if check_password():
             else:
                 st.info("近期无显著大宗异动")
 
-        # --- 第五阶段：历史明细 (重新补回 MA5) ---
+        # --- 第五阶段：历史明细 ---
         st.subheader("📋 历史明细 (集成 MFI)")
         hist_show = hist_df.tail(15).copy()
         hist_show['换手'] = (hist_show['换手率_raw'] * 100).map('{:.2f}%'.format)
         
-        # 严格检查并展示 MA5
         cols_to_show = ['Open', 'High', 'Low', 'Close', '换手', 'MFI', 'MA20', 'MA5']
         st.dataframe(hist_show[cols_to_show].style.format(
             subset=['Open', 'High', 'Low', 'Close', 'MFI', 'MA20', 'MA5'], precision=2
