@@ -47,14 +47,14 @@ def get_enhanced_market_data():
         vix = vix_tk.fast_info['last_price']
         vix_pct = (vix / vix_tk.fast_info['previous_close'] - 1)
 
-        # 2. 期权链处理 (避开到期归零合约)
+        # 2. 期权链处理 (全景期权链: 包含 Calls 和 Puts)
         exp_dates = tk.options
         calls_df = pd.DataFrame()
+        puts_df = pd.DataFrame()
         current_exp = "N/A"
         
         if exp_dates:
             today_str = datetime.now().strftime('%Y-%m-%d')
-            # 若第一期权链在今天或以前，切换下一个到期日以防数据全0
             if exp_dates[0] <= today_str and len(exp_dates) > 1:
                 current_exp = exp_dates[1] 
             else:
@@ -63,12 +63,20 @@ def get_enhanced_market_data():
             try:
                 curr_p = hist['Close'].iloc[-1]
                 opt_data = tk.option_chain(current_exp)
+                
+                # 处理 Calls
                 all_calls = opt_data.calls
-                # 平值期权 (ATM) 中心化切片
-                atm_idx = (all_calls['strike'] - curr_p).abs().idxmin()
-                start_idx = max(0, atm_idx - 4)
-                end_idx = min(len(all_calls), atm_idx + 5)
-                calls_df = all_calls.iloc[start_idx:end_idx]
+                atm_idx_c = (all_calls['strike'] - curr_p).abs().idxmin()
+                start_idx_c = max(0, atm_idx_c - 4)
+                end_idx_c = min(len(all_calls), atm_idx_c + 5)
+                calls_df = all_calls.iloc[start_idx_c:end_idx_c]
+                
+                # 处理 Puts
+                all_puts = opt_data.puts
+                atm_idx_p = (all_puts['strike'] - curr_p).abs().idxmin()
+                start_idx_p = max(0, atm_idx_p - 4)
+                end_idx_p = min(len(all_puts), atm_idx_p + 5)
+                puts_df = all_puts.iloc[start_idx_p:end_idx_p]
             except: pass
 
         # 3. 基础处理与技术指标
@@ -104,7 +112,7 @@ def get_enhanced_market_data():
         m_l = LinearRegression().fit(X, fit_df['Low'].values / fit_df['昨收'].values - 1)
         reg_params = {'slope_h': m_h.coef_[0], 'inter_h': m_h.intercept_, 'slope_l': m_l.coef_[0], 'inter_l': m_l.intercept_}
 
-        return hist, reg_params, calls_df, dark_prints, {
+        return hist, reg_params, calls_df, puts_df, dark_prints, {
             'btc': btc, 'nasdaq': nasdaq, 'nasdaq_pct': nasdaq_pct, 
             'vix': vix, 'vix_pct': vix_pct,
             'float': current_float, 'volume': rt_v, 'exp': current_exp
@@ -119,7 +127,8 @@ if check_password():
     data = get_enhanced_market_data()
     
     if data:
-        hist_df, reg, calls_df, dark_df, mkt = data
+        # 注意：此处增加分解 puts_df
+        hist_df, reg, calls_df, puts_df, dark_df, mkt = data
         last_h = hist_df.iloc[-1]
         curr_p = last_h['Close']
 
@@ -157,7 +166,7 @@ if check_password():
         fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
         p_df = hist_df.tail(40).copy()
         
-        # 将日期强制格式化为文本，避免图表自动产生周末空档
+        # 将日期强制格式化为文本，避免周末空档
         p_df['label'] = pd.to_datetime(p_df.index).strftime('%m-%d')
         
         # BOLL 线
@@ -174,7 +183,7 @@ if check_password():
         
         fig_k.update_layout(height=650, xaxis_rangeslider_visible=False, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         
-        # 重点修改区域：强制 X 轴为分类轴，每 1 天显示一个刻度，倾斜 90 度防拥挤
+        # X 轴分类、步长1、垂直90度
         fig_k.update_xaxes(
             type='category', 
             tickmode='linear', 
@@ -184,22 +193,34 @@ if check_password():
 
         st.plotly_chart(fig_k, use_container_width=True)
 
-        # --- 第四阶段：期权与大宗 ---
+        # --- 第四阶段：期权与大宗 (全景期权链) ---
         st.divider()
         o_col, d_col = st.columns(2)
         with o_col:
-            st.subheader(f"🕯️ 活跃期权链 (到期: {mkt['exp']})")
-            if not calls_df.empty:
-                display_calls = calls_df[['strike', 'lastPrice', 'openInterest', 'impliedVolatility']].copy()
-                display_calls.columns = ['行权价', '最新价', '未平仓', '隐波']
-                st.dataframe(display_calls.style.format({
-                    '隐波': '{:.2%}', 
-                    '最新价': '{:.2f}', 
-                    '行权价': '{:.2f}',
-                    '未平仓': '{:,.0f}' 
-                }), use_container_width=True)
-            else:
-                st.info("当前无可用期权数据")
+            st.subheader(f"🕯️ 全景期权链 (到期: {mkt['exp']})")
+            
+            # 使用 Tabs 优雅呈现 Call 和 Put，不占用额外宽度
+            tab1, tab2 = st.tabs(["📈 看涨 (Calls)", "📉 看跌 (Puts)"])
+            
+            with tab1:
+                if not calls_df.empty:
+                    display_calls = calls_df[['strike', 'lastPrice', 'openInterest', 'impliedVolatility']].copy()
+                    display_calls.columns = ['行权价', '最新价', '未平仓', '隐波']
+                    st.dataframe(display_calls.style.format({
+                        '隐波': '{:.2%}', '最新价': '{:.2f}', '行权价': '{:.2f}', '未平仓': '{:,.0f}' 
+                    }), use_container_width=True)
+                else:
+                    st.info("当前无看涨期权数据")
+                    
+            with tab2:
+                if not puts_df.empty:
+                    display_puts = puts_df[['strike', 'lastPrice', 'openInterest', 'impliedVolatility']].copy()
+                    display_puts.columns = ['行权价', '最新价', '未平仓', '隐波']
+                    st.dataframe(display_puts.style.format({
+                        '隐波': '{:.2%}', '最新价': '{:.2f}', '行权价': '{:.2f}', '未平仓': '{:,.0f}' 
+                    }), use_container_width=True)
+                else:
+                    st.info("当前无看跌期权数据")
                 
         with d_col:
             st.subheader("🌑 大宗异动打印 (Dark Pool Print)")
