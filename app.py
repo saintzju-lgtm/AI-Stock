@@ -11,7 +11,7 @@ from datetime import datetime
 # --- 0. 页面全局配置 ---
 st.set_page_config(layout="wide", page_title="专业量化决策终端")
 
-# --- 新增：智能中英文模糊匹配引擎 ---
+# --- 智能中英文模糊匹配引擎 ---
 TICKER_MAP = {
     "苹果": "AAPL", "APPLE": "AAPL",
     "特斯拉": "TSLA", "TESLA": "TSLA",
@@ -42,17 +42,14 @@ def fuzzy_match_ticker(query):
     query = query.strip().upper()
     if not query: return "BTDR"
     
-    # 1. 绝对匹配
     if query in TICKER_MAP.values(): return query
     if query in TICKER_MAP: return TICKER_MAP[query]
         
-    # 2. 模糊包含匹配 (防单字母误伤，长度>=2才模糊)
     if len(query) >= 2:
         for name, ticker in TICKER_MAP.items():
             if query in name:
                 return ticker
                 
-    # 3. 兜底：将用户输入当做原生态 Ticker
     return query
 
 # --- 1. 核心量化引擎 ---
@@ -128,7 +125,7 @@ def get_enhanced_market_data(ticker_symbol):
         mfr = pd.Series(pos_flow).rolling(14).sum() / pd.Series(neg_flow).rolling(14).sum()
         hist['MFI'] = 100 - (100 / (1 + mfr.values))
 
-        # 4. 暗池/大宗打印 (1.2倍均量偏离识别)
+        # 4. 暗池/大宗打印
         avg_vol = hist['Volume'].mean()
         dark_prints = hist[hist['Volume'] > avg_vol * 1.2].tail(8).copy()
         dark_prints['Signal'] = dark_prints.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
@@ -152,30 +149,40 @@ def get_enhanced_market_data(ticker_symbol):
 # --- 2. UI 渲染 ---
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; padding-bottom: 5px; } </style>""", unsafe_allow_html=True)
 
-# 侧边栏全局配置
+# --- 防刷核心机制初始化 ---
 if 'current_ticker' not in st.session_state:
     st.session_state.current_ticker = "BTDR"
+if 'last_query_time' not in st.session_state:
+    st.session_state.last_query_time = 0.0  # 初始时间戳为0，允许第一次查询
 
 with st.sidebar:
     st.markdown("### 🔍 切换股票")
-    # 获取用户输入
     raw_input = st.text_input("支持中英文/拼音模糊搜索 (如 苹果/AAPL)", value=st.session_state.current_ticker)
     
-    # 触发中英文模糊转换引擎
     new_ticker = fuzzy_match_ticker(raw_input)
     
+    # 检测到用户尝试更换股票
     if new_ticker and new_ticker != st.session_state.current_ticker:
-        st.session_state.current_ticker = new_ticker
-        st.rerun() # 更改代码后立即刷新
+        current_time = time.time()
+        time_elapsed = current_time - st.session_state.last_query_time
+        
+        # 冷却时间不足 60 秒，触发防刷保护
+        if time_elapsed < 60.0:
+            remaining = int(60.0 - time_elapsed)
+            st.error(f"⏳ 防刷保护生效：\n请等待 **{remaining} 秒** 后再查询新股票！")
+        else:
+            # 允许切换，并刷新冷却时间
+            st.session_state.current_ticker = new_ticker
+            st.session_state.last_query_time = current_time
+            st.rerun() 
     
     st.divider()
-    # 默认开启 1 分钟自动刷新
     auto_refresh = st.checkbox("开启 1分钟自动无感刷新", value=True)
 
 ticker = st.session_state.current_ticker
 st.title(f"🎯 {ticker} 专业量化决策终端")
 
-# 传入动态 Ticker
+# 传入动态 Ticker (同股票高频刷新会直接走本地 @st.cache_data 内存，不耗费真实请求)
 data = get_enhanced_market_data(ticker)
 
 if isinstance(data, str):
