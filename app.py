@@ -29,30 +29,35 @@ def fuzzy_match_ticker(query):
             if query in name: return ticker
     return query
 
-# --- 1. 核心量化引擎 (依赖 YF 自带底层反爬) ---
+# --- 1. 核心量化引擎 (引入节流机制与局部容错) ---
 @st.cache_data(ttl=300) 
 def get_enhanced_market_data(ticker_symbol):
     try:
-        time.sleep(1) # 轻微延迟，防止一瞬间并发
+        # 主股数据获取
         tk = yf.Ticker(ticker_symbol)
-        info = tk.info
         hist = tk.history(period="100d", interval="1d")
         
-        if hist.empty: return "数据源返回为空，请检查代码或等待接口恢复。"
+        if hist.empty: 
+            return "获取历史数据为空，IP 可能仍处于 Yahoo 的限制黑名单中，请更换 VPN 节点。"
+        
+        info = tk.info
+        time.sleep(0.5) # 滴水式节流：等待 0.5 秒再发下一个请求
 
-        # 容错获取宏观数据 (移除自定义 session)
+        # 容错获取宏观数据，局部失败不影响主程序
         def safe_get_macro(sym):
             try:
                 t = yf.Ticker(sym)
                 p = t.fast_info['last_price']
+                time.sleep(0.5) # 节流保护
                 return p, (p / t.fast_info['previous_close'] - 1)
-            except: return 0.0, 0.0
+            except: 
+                return 0.0, 0.0
 
         btc, _ = safe_get_macro("BTC-USD")
         nasdaq, nasdaq_pct = safe_get_macro("^IXIC")
         vix, vix_pct = safe_get_macro("^VIX")
 
-        # 期权链处理
+        # 期权链处理容错
         calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
         current_exp = "N/A"
         try:
@@ -60,16 +65,21 @@ def get_enhanced_market_data(ticker_symbol):
             if exp_dates:
                 today_str = datetime.now().strftime('%Y-%m-%d')
                 current_exp = exp_dates[1] if (exp_dates[0] <= today_str and len(exp_dates) > 1) else exp_dates[0]
+                
+                time.sleep(0.5) # 节流保护
                 opt_data = tk.option_chain(current_exp)
                 curr_p = hist['Close'].iloc[-1]
+                
                 # ATM 切片
                 for df_type in ['calls', 'puts']:
                     df = getattr(opt_data, df_type)
-                    idx = (df['strike'] - curr_p).abs().idxmin()
-                    slice_df = df.iloc[max(0, idx-4) : min(len(df), idx+5)]
-                    if df_type == 'calls': calls_df = slice_df
-                    else: puts_df = slice_df
-        except: pass
+                    if not df.empty:
+                        idx = (df['strike'] - curr_p).abs().idxmin()
+                        slice_df = df.iloc[max(0, idx-4) : min(len(df), idx+5)]
+                        if df_type == 'calls': calls_df = slice_df
+                        else: puts_df = slice_df
+        except: 
+            pass # 期权获取失败直接跳过，保证主图还能画出来
 
         # 指标计算
         current_float = info.get('floatShares') or info.get('shares') or 118500000
@@ -105,6 +115,8 @@ def get_enhanced_market_data(ticker_symbol):
             'vix': vix, 'vix_pct': vix_pct, 'float': current_float, 'volume': info.get('regularMarketVolume', 0), 'exp': current_exp
         }
     except Exception as e:
+        if "429" in str(e) or "Too Many Requests" in str(e):
+            return "IP 已被 Yahoo 封锁 (HTTP 429)。请彻底更换 VPN 节点并清理缓存后再试。"
         return f"系统核心异常: {str(e)}"
 
 # --- 2. UI 渲染 ---
@@ -119,7 +131,7 @@ with st.sidebar:
     new_tk = fuzzy_match_ticker(raw_input)
     
     if new_tk and new_tk != st.session_state.current_ticker:
-        # 防刷锁：30 秒内禁止连续查询新股票
+        # 防刷锁：限制每次查询间隔 30 秒
         if (time.time() - st.session_state.last_q_time) < 30.0:
             st.error(f"⏳ 防刷锁生效: 请等待 {int(30 - (time.time()-st.session_state.last_q_time))} 秒再切换")
         else:
@@ -141,9 +153,9 @@ elif data:
     
     # 宏观看板
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Bitcoin", f"${mkt['btc']:,.0f}" if mkt['btc'] > 0 else "N/A")
-    m2.metric("Nasdaq", f"{mkt['nasdaq']:,.2f}" if mkt['nasdaq'] > 0 else "N/A", f"{mkt['nasdaq_pct']:.2%}")
-    m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}" if mkt['vix'] > 0 else "N/A", f"{mkt['vix_pct']:.2%}", delta_color="inverse")
+    m1.metric("Bitcoin", f"${mkt['btc']:,.0f}" if mkt['btc'] > 0 else "加载失败")
+    m2.metric("Nasdaq", f"{mkt['nasdaq']:,.2f}" if mkt['nasdaq'] > 0 else "加载失败", f"{mkt['nasdaq_pct']:.2%}")
+    m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}" if mkt['vix'] > 0 else "加载失败", f"{mkt['vix_pct']:.2%}", delta_color="inverse")
     m4.metric(f"{ticker} 现价", f"${last['Close']:.2f}", f"{(last['Close']/last['昨收']-1):.2%}")
 
     st.divider()
@@ -190,10 +202,10 @@ elif data:
         t1, t2 = st.tabs(["📈 看涨 (Calls)", "📉 看跌 (Puts)"])
         with t1: 
             if not calls_df.empty: st.dataframe(calls_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
-            else: st.info("无数据")
+            else: st.info("受接口频控限制，暂时无法加载看涨数据")
         with t2: 
             if not puts_df.empty: st.dataframe(puts_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
-            else: st.info("无数据")
+            else: st.info("受接口频控限制，暂时无法加载看跌数据")
             
     with d_col:
         st.subheader("🌑 大宗打印 (Dark Pool)")
