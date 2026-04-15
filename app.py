@@ -7,8 +7,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
 from datetime import datetime
-import requests
-import random
 
 # --- 0. 页面全局配置 ---
 st.set_page_config(layout="wide", page_title="专业量化决策终端")
@@ -31,27 +29,21 @@ def fuzzy_match_ticker(query):
             if query in name: return ticker
     return query
 
-# --- 1. 核心量化引擎 (防封锁增强版: 缓存延长至 300秒) ---
+# --- 1. 核心量化引擎 (依赖 YF 自带底层反爬) ---
 @st.cache_data(ttl=300) 
 def get_enhanced_market_data(ticker_symbol):
     try:
-        # 伪装浏览器 Session
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        })
-        
-        time.sleep(1.5) 
-        tk = yf.Ticker(ticker_symbol, session=session)
+        time.sleep(1) # 轻微延迟，防止一瞬间并发
+        tk = yf.Ticker(ticker_symbol)
         info = tk.info
         hist = tk.history(period="100d", interval="1d")
         
-        if hist.empty: return "数据源返回为空，请检查代码或 IP 是否被限制。"
+        if hist.empty: return "数据源返回为空，请检查代码或等待接口恢复。"
 
-        # 容错获取宏观数据
+        # 容错获取宏观数据 (移除自定义 session)
         def safe_get_macro(sym):
             try:
-                t = yf.Ticker(sym, session=session)
+                t = yf.Ticker(sym)
                 p = t.fast_info['last_price']
                 return p, (p / t.fast_info['previous_close'] - 1)
             except: return 0.0, 0.0
@@ -113,7 +105,7 @@ def get_enhanced_market_data(ticker_symbol):
             'vix': vix, 'vix_pct': vix_pct, 'float': current_float, 'volume': info.get('regularMarketVolume', 0), 'exp': current_exp
         }
     except Exception as e:
-        return f"系统异常: {str(e)}"
+        return f"系统核心异常: {str(e)}"
 
 # --- 2. UI 渲染 ---
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; } </style>""", unsafe_allow_html=True)
@@ -127,12 +119,14 @@ with st.sidebar:
     new_tk = fuzzy_match_ticker(raw_input)
     
     if new_tk and new_tk != st.session_state.current_ticker:
-        if (time.time() - st.session_state.last_q_time) < 30.0: # 换股保护设为 30秒
-            st.error(f"⏳ 请等待 {int(30 - (time.time()-st.session_state.last_q_time))} 秒再切换")
+        # 防刷锁：30 秒内禁止连续查询新股票
+        if (time.time() - st.session_state.last_q_time) < 30.0:
+            st.error(f"⏳ 防刷锁生效: 请等待 {int(30 - (time.time()-st.session_state.last_q_time))} 秒再切换")
         else:
             st.session_state.current_ticker = new_tk
             st.session_state.last_q_time = time.time()
             st.rerun()
+            
     st.divider()
     auto_refresh = st.checkbox("开启 5分钟自动无感刷新", value=True)
 
@@ -147,9 +141,9 @@ elif data:
     
     # 宏观看板
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Bitcoin", f"${mkt['btc']:,.0f}")
-    m2.metric("Nasdaq", f"{mkt['nasdaq']:,.2f}", f"{mkt['nasdaq_pct']:.2%}")
-    m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}", f"{mkt['vix_pct']:.2%}", delta_color="inverse")
+    m1.metric("Bitcoin", f"${mkt['btc']:,.0f}" if mkt['btc'] > 0 else "N/A")
+    m2.metric("Nasdaq", f"{mkt['nasdaq']:,.2f}" if mkt['nasdaq'] > 0 else "N/A", f"{mkt['nasdaq_pct']:.2%}")
+    m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}" if mkt['vix'] > 0 else "N/A", f"{mkt['vix_pct']:.2%}", delta_color="inverse")
     m4.metric(f"{ticker} 现价", f"${last['Close']:.2f}", f"{(last['Close']/last['昨收']-1):.2%}")
 
     st.divider()
@@ -158,7 +152,9 @@ elif data:
     c1, c2 = st.columns([1, 1.5])
     with c1:
         st.subheader("📊 实时指标")
-        st.write(f"实时换手: **{(mkt['volume']/mkt['float'])*100:.2f}%**")
+        # 换手率容错，防 0 做分母
+        turnover_rate = (mkt['volume']/mkt['float'])*100 if mkt['float'] > 0 else 0
+        st.write(f"实时换手: **{turnover_rate:.2f}%**")
         st.write(f"BOLL 高/低: **{last['Upper']:.2f} / {last['Lower']:.2f}**")
         st.write(f"资金 MFI: **{last['MFI']:.2f}**")
     with c2:
@@ -191,12 +187,18 @@ elif data:
     o_col, d_col = st.columns(2)
     with o_col:
         st.subheader(f"🕯️ 全景期权 (到期:{mkt['exp']})")
-        t1, t2 = st.tabs(["📈 看涨", "📉 看跌"])
-        with t1: st.dataframe(calls_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format(precision=2), use_container_width=True)
-        with t2: st.dataframe(puts_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format(precision=2), use_container_width=True)
+        t1, t2 = st.tabs(["📈 看涨 (Calls)", "📉 看跌 (Puts)"])
+        with t1: 
+            if not calls_df.empty: st.dataframe(calls_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
+            else: st.info("无数据")
+        with t2: 
+            if not puts_df.empty: st.dataframe(puts_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
+            else: st.info("无数据")
+            
     with d_col:
         st.subheader("🌑 大宗打印 (Dark Pool)")
-        st.table(dark_df[['Volume', 'Signal']])
+        if not dark_df.empty: st.table(dark_df[['Volume', 'Signal']])
+        else: st.info("近期无显著异动")
 
     # 历史明细
     st.subheader("📋 历史明细")
