@@ -14,8 +14,8 @@ def check_password():
         st.session_state.password_correct = False
     
     if not st.session_state.password_correct:
-        st.set_page_config(layout="wide", page_title="BTDR Quant Pro")
-        st.title("🎯 BTDR 专业量化决策终端")
+        st.set_page_config(layout="wide", page_title="专业量化决策终端")
+        st.title("🎯 专业量化决策终端")
         pwd = st.text_input("输入访问码", type="password")
         if st.button("进入系统"):
             if pwd == st.secrets.get("ACCESS_PASSWORD", "123456"):
@@ -27,27 +27,27 @@ def check_password():
         return False
     return True
 
-# --- 1. 核心量化引擎 (增强容错版) ---
+# --- 1. 核心量化引擎 (支持动态切换股票) ---
 @st.cache_data(ttl=3600)
-def get_enhanced_market_data():
+def get_enhanced_market_data(ticker_symbol):
     try:
         time.sleep(1.5) # 模拟延迟，防止触发封锁
-        tk = yf.Ticker("BTDR")
+        tk = yf.Ticker(ticker_symbol)
         info = tk.info
         hist = tk.history(period="100d", interval="1d")
         
         if hist.empty: 
-            return "BTDR 历史数据获取为空，请检查股票代码或网络封锁情况。"
+            return "股票历史数据获取为空，请检查股票代码是否正确或网络状况。"
 
         # --- 容错获取宏观数据 ---
-        def safe_get_macro(ticker_symbol):
+        def safe_get_macro(ticker_sym):
             try:
-                t = yf.Ticker(ticker_symbol)
+                t = yf.Ticker(ticker_sym)
                 last_p = t.fast_info['last_price']
                 prev_p = t.fast_info['previous_close']
                 return last_p, (last_p / prev_p - 1)
             except:
-                return 0.0, 0.0 # 失败时返回 0，不导致整个程序崩溃
+                return 0.0, 0.0 
 
         btc, _ = safe_get_macro("BTC-USD")
         nasdaq, nasdaq_pct = safe_get_macro("^IXIC")
@@ -78,7 +78,7 @@ def get_enhanced_market_data():
                 atm_idx_p = (all_puts['strike'] - curr_p).abs().idxmin()
                 puts_df = all_puts.iloc[max(0, atm_idx_p - 4) : min(len(all_puts), atm_idx_p + 5)]
         except Exception as e:
-            pass # 期权获取失败时静默跳过，保证主图还能画出来
+            pass 
 
         # 3. 基础处理与技术指标
         current_float = info.get('floatShares') or info.get('shares') or 118500000
@@ -125,12 +125,28 @@ def get_enhanced_market_data():
 if check_password():
     st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; padding-bottom: 5px; } </style>""", unsafe_allow_html=True)
 
-    data = get_enhanced_market_data()
+    # --- 新增：侧边栏全局配置 ---
+    if 'current_ticker' not in st.session_state:
+        st.session_state.current_ticker = "BTDR"
+
+    with st.sidebar:
+        st.markdown("### 添加新股票")
+        new_ticker = st.text_input("", value=st.session_state.current_ticker, label_visibility="collapsed")
+        if new_ticker and new_ticker.upper() != st.session_state.current_ticker:
+            st.session_state.current_ticker = new_ticker.upper()
+            st.rerun() # 更改代码后立即刷新
+        
+        st.divider()
+        auto_refresh = st.checkbox("开启 1分钟自动无感刷新", value=False)
+
+    ticker = st.session_state.current_ticker
+    st.title(f"🎯 {ticker} 专业量化决策终端")
+
+    # 传入动态 Ticker
+    data = get_enhanced_market_data(ticker)
     
     if isinstance(data, str):
-        # 如果返回的是字符串，说明捕获到了具体错误
         st.error(f"⚠️ 数据加载失败。详细错误: {data}")
-        st.warning("建议尝试：1. 点击右上方菜单的 'Clear cache' 2. 更换 VPN 节点 3. 等待几分钟后再刷新。")
     elif data:
         hist_df, reg, calls_df, puts_df, dark_df, mkt = data
         last_h = hist_df.iloc[-1]
@@ -142,7 +158,7 @@ if check_password():
         m1.metric("Bitcoin (BTC)", f"${mkt['btc']:,.0f}" if mkt['btc'] > 0 else "N/A")
         m2.metric("Nasdaq Index", f"{mkt['nasdaq']:,.2f}" if mkt['nasdaq'] > 0 else "N/A", f"{mkt['nasdaq_pct']:.2%}")
         m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}" if mkt['vix'] > 0 else "N/A", f"{mkt['vix_pct']:.2%}", delta_color="inverse")
-        m4.metric("BTDR 现价", f"${curr_p:.2f}", f"{(curr_p/last_h['昨收']-1):.2%}")
+        m4.metric(f"{ticker} 现价", f"${curr_p:.2f}", f"{(curr_p/last_h['昨收']-1):.2%}")
 
         st.divider()
 
@@ -170,24 +186,17 @@ if check_password():
         fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
         p_df = hist_df.tail(40).copy()
         
-        # 将日期强制格式化为文本
         p_df['label'] = pd.to_datetime(p_df.index).strftime('%m-%d')
         
-        # BOLL 线
         fig_k.add_trace(go.Scatter(x=p_df['label'], y=p_df['Upper'], line=dict(color='rgba(0,102,204,0.5)', width=1.5), name=f"BOLL High: {last_h['Upper']:.2f}"), row=1, col=1)
         fig_k.add_trace(go.Scatter(x=p_df['label'], y=p_df['Lower'], line=dict(color='rgba(0,102,204,0.5)', width=1.5), fill='tonexty', fillcolor='rgba(0,102,204,0.1)', name=f"BOLL Low: {last_h['Lower']:.2f}"), row=1, col=1)
-        
-        # K线与MA5
         fig_k.add_trace(go.Candlestick(x=p_df['label'], open=p_df['Open'], high=p_df['High'], low=p_df['Low'], close=p_df['Close'], name="K线"), row=1, col=1)
         fig_k.add_trace(go.Scatter(x=p_df['label'], y=p_df['MA5'], name=f"MA5: {last_h['MA5']:.2f}", line=dict(color='#FF9800', width=2)), row=1, col=1)
         
-        # 换手柱红绿配色
         vol_colors = ['#E53935' if (p_df['Close'].iloc[i] >= p_df['Open'].iloc[i]) else '#43A047' for i in range(len(p_df))]
         fig_k.add_trace(go.Bar(x=p_df['label'], y=p_df['换手率_raw']*100, name="换手率%", marker_color=vol_colors), row=2, col=1)
         
         fig_k.update_layout(height=650, xaxis_rangeslider_visible=False, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        
-        # X 轴：步长1、垂直90度
         fig_k.update_xaxes(type='category', tickmode='linear', dtick=1, tickangle=-90)
         st.plotly_chart(fig_k, use_container_width=True)
 
@@ -196,7 +205,6 @@ if check_password():
         o_col, d_col = st.columns(2)
         with o_col:
             st.subheader(f"🕯️ 全景期权链 (到期: {mkt['exp']})")
-            
             tab1, tab2 = st.tabs(["📈 看涨 (Calls)", "📉 看跌 (Puts)"])
             with tab1:
                 if not calls_df.empty:
@@ -204,15 +212,14 @@ if check_password():
                     display_calls.columns = ['行权价', '最新价', '未平仓', '隐波']
                     st.dataframe(display_calls.style.format({'隐波': '{:.2%}', '最新价': '{:.2f}', '行权价': '{:.2f}', '未平仓': '{:,.0f}'}), use_container_width=True)
                 else:
-                    st.info("当前无看涨期权数据，可能受接口限制")
-                    
+                    st.info("当前无看涨期权数据")
             with tab2:
                 if not puts_df.empty:
                     display_puts = puts_df[['strike', 'lastPrice', 'openInterest', 'impliedVolatility']].copy()
                     display_puts.columns = ['行权价', '最新价', '未平仓', '隐波']
                     st.dataframe(display_puts.style.format({'隐波': '{:.2%}', '最新价': '{:.2f}', '行权价': '{:.2f}', '未平仓': '{:,.0f}'}), use_container_width=True)
                 else:
-                    st.info("当前无看跌期权数据，可能受接口限制")
+                    st.info("当前无看跌期权数据")
                 
         with d_col:
             st.subheader("🌑 大宗异动打印 (Dark Pool Print)")
@@ -232,6 +239,11 @@ if check_password():
         st.dataframe(hist_show[cols_to_show].style.format(
             subset=['Open', 'High', 'Low', 'Close', 'MFI', 'MA20', 'MA5'], precision=2
         ), use_container_width=True)
+
+        # --- 新增：自动刷新控制 ---
+        if auto_refresh:
+            time.sleep(60) # 等待 60 秒
+            st.rerun()     # 自动重新运行脚本实现刷新
 
     else:
         st.error("⚠️ 发生未知错误，数据返回为空。")
