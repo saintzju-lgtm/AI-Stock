@@ -18,7 +18,7 @@ def check_password():
         st.title("🎯 BTDR 专业量化决策终端")
         pwd = st.text_input("输入访问码", type="password")
         if st.button("进入系统"):
-            if pwd == st.secrets.get("ACCESS_PASSWORD", "saintzju"):
+            if pwd == st.secrets.get("ACCESS_PASSWORD", "123456"):
                 st.session_state.password_correct = True
                 st.rerun()
             else:
@@ -27,7 +27,7 @@ def check_password():
         return False
     return True
 
-# --- 1. 核心量化引擎 ---
+# --- 1. 核心量化引擎 (增强容错版) ---
 @st.cache_data(ttl=3600)
 def get_enhanced_market_data():
     try:
@@ -35,49 +35,50 @@ def get_enhanced_market_data():
         tk = yf.Ticker("BTDR")
         info = tk.info
         hist = tk.history(period="100d", interval="1d")
-        if hist.empty: return None
-
-        # 1. 抓取宏观与锚点数据
-        btc = yf.Ticker("BTC-USD").fast_info['last_price']
-        nas_tk = yf.Ticker("^IXIC")
-        nasdaq = nas_tk.fast_info['last_price']
-        nasdaq_pct = (nasdaq / nas_tk.fast_info['previous_close'] - 1)
         
-        vix_tk = yf.Ticker("^VIX")
-        vix = vix_tk.fast_info['last_price']
-        vix_pct = (vix / vix_tk.fast_info['previous_close'] - 1)
+        if hist.empty: 
+            return "BTDR 历史数据获取为空，请检查股票代码或网络封锁情况。"
 
-        # 2. 期权链处理 (全景期权链: 包含 Calls 和 Puts)
-        exp_dates = tk.options
-        calls_df = pd.DataFrame()
-        puts_df = pd.DataFrame()
-        current_exp = "N/A"
-        
-        if exp_dates:
-            today_str = datetime.now().strftime('%Y-%m-%d')
-            if exp_dates[0] <= today_str and len(exp_dates) > 1:
-                current_exp = exp_dates[1] 
-            else:
-                current_exp = exp_dates[0]
-                
+        # --- 容错获取宏观数据 ---
+        def safe_get_macro(ticker_symbol):
             try:
+                t = yf.Ticker(ticker_symbol)
+                last_p = t.fast_info['last_price']
+                prev_p = t.fast_info['previous_close']
+                return last_p, (last_p / prev_p - 1)
+            except:
+                return 0.0, 0.0 # 失败时返回 0，不导致整个程序崩溃
+
+        btc, _ = safe_get_macro("BTC-USD")
+        nasdaq, nasdaq_pct = safe_get_macro("^IXIC")
+        vix, vix_pct = safe_get_macro("^VIX")
+
+        # --- 容错获取期权链 ---
+        calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
+        current_exp = "N/A"
+        try:
+            exp_dates = tk.options
+            if exp_dates:
+                today_str = datetime.now().strftime('%Y-%m-%d')
+                if exp_dates[0] <= today_str and len(exp_dates) > 1:
+                    current_exp = exp_dates[1] 
+                else:
+                    current_exp = exp_dates[0]
+                    
                 curr_p = hist['Close'].iloc[-1]
                 opt_data = tk.option_chain(current_exp)
                 
-                # 处理 Calls
+                # Calls 切片
                 all_calls = opt_data.calls
                 atm_idx_c = (all_calls['strike'] - curr_p).abs().idxmin()
-                start_idx_c = max(0, atm_idx_c - 4)
-                end_idx_c = min(len(all_calls), atm_idx_c + 5)
-                calls_df = all_calls.iloc[start_idx_c:end_idx_c]
+                calls_df = all_calls.iloc[max(0, atm_idx_c - 4) : min(len(all_calls), atm_idx_c + 5)]
                 
-                # 处理 Puts
+                # Puts 切片
                 all_puts = opt_data.puts
                 atm_idx_p = (all_puts['strike'] - curr_p).abs().idxmin()
-                start_idx_p = max(0, atm_idx_p - 4)
-                end_idx_p = min(len(all_puts), atm_idx_p + 5)
-                puts_df = all_puts.iloc[start_idx_p:end_idx_p]
-            except: pass
+                puts_df = all_puts.iloc[max(0, atm_idx_p - 4) : min(len(all_puts), atm_idx_p + 5)]
+        except Exception as e:
+            pass # 期权获取失败时静默跳过，保证主图还能画出来
 
         # 3. 基础处理与技术指标
         current_float = info.get('floatShares') or info.get('shares') or 118500000
@@ -118,7 +119,7 @@ def get_enhanced_market_data():
             'float': current_float, 'volume': rt_v, 'exp': current_exp
         }
     except Exception as e:
-        return None
+        return f"系统核心异常: {str(e)}"
 
 # --- 2. UI 渲染 ---
 if check_password():
@@ -126,8 +127,11 @@ if check_password():
 
     data = get_enhanced_market_data()
     
-    if data:
-        # 注意：此处增加分解 puts_df
+    if isinstance(data, str):
+        # 如果返回的是字符串，说明捕获到了具体错误
+        st.error(f"⚠️ 数据加载失败。详细错误: {data}")
+        st.warning("建议尝试：1. 点击右上方菜单的 'Clear cache' 2. 更换 VPN 节点 3. 等待几分钟后再刷新。")
+    elif data:
         hist_df, reg, calls_df, puts_df, dark_df, mkt = data
         last_h = hist_df.iloc[-1]
         curr_p = last_h['Close']
@@ -135,9 +139,9 @@ if check_password():
         # --- 第一阶段：大盘与宏观 ---
         st.subheader("🌐 宏观风险防御看板")
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Bitcoin (BTC)", f"${mkt['btc']:,.0f}")
-        m2.metric("Nasdaq Index", f"{mkt['nasdaq']:,.2f}", f"{mkt['nasdaq_pct']:.2%}")
-        m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}", f"{mkt['vix_pct']:.2%}", delta_color="inverse")
+        m1.metric("Bitcoin (BTC)", f"${mkt['btc']:,.0f}" if mkt['btc'] > 0 else "N/A")
+        m2.metric("Nasdaq Index", f"{mkt['nasdaq']:,.2f}" if mkt['nasdaq'] > 0 else "N/A", f"{mkt['nasdaq_pct']:.2%}")
+        m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}" if mkt['vix'] > 0 else "N/A", f"{mkt['vix_pct']:.2%}", delta_color="inverse")
         m4.metric("BTDR 现价", f"${curr_p:.2f}", f"{(curr_p/last_h['昨收']-1):.2%}")
 
         st.divider()
@@ -166,7 +170,7 @@ if check_password():
         fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
         p_df = hist_df.tail(40).copy()
         
-        # 将日期强制格式化为文本，避免周末空档
+        # 将日期强制格式化为文本
         p_df['label'] = pd.to_datetime(p_df.index).strftime('%m-%d')
         
         # BOLL 线
@@ -183,44 +187,32 @@ if check_password():
         
         fig_k.update_layout(height=650, xaxis_rangeslider_visible=False, template="plotly_white", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         
-        # X 轴分类、步长1、垂直90度
-        fig_k.update_xaxes(
-            type='category', 
-            tickmode='linear', 
-            dtick=1, 
-            tickangle=-90
-        )
-
+        # X 轴：步长1、垂直90度
+        fig_k.update_xaxes(type='category', tickmode='linear', dtick=1, tickangle=-90)
         st.plotly_chart(fig_k, use_container_width=True)
 
-        # --- 第四阶段：期权与大宗 (全景期权链) ---
+        # --- 第四阶段：期权与大宗 ---
         st.divider()
         o_col, d_col = st.columns(2)
         with o_col:
             st.subheader(f"🕯️ 全景期权链 (到期: {mkt['exp']})")
             
-            # 使用 Tabs 优雅呈现 Call 和 Put，不占用额外宽度
             tab1, tab2 = st.tabs(["📈 看涨 (Calls)", "📉 看跌 (Puts)"])
-            
             with tab1:
                 if not calls_df.empty:
                     display_calls = calls_df[['strike', 'lastPrice', 'openInterest', 'impliedVolatility']].copy()
                     display_calls.columns = ['行权价', '最新价', '未平仓', '隐波']
-                    st.dataframe(display_calls.style.format({
-                        '隐波': '{:.2%}', '最新价': '{:.2f}', '行权价': '{:.2f}', '未平仓': '{:,.0f}' 
-                    }), use_container_width=True)
+                    st.dataframe(display_calls.style.format({'隐波': '{:.2%}', '最新价': '{:.2f}', '行权价': '{:.2f}', '未平仓': '{:,.0f}'}), use_container_width=True)
                 else:
-                    st.info("当前无看涨期权数据")
+                    st.info("当前无看涨期权数据，可能受接口限制")
                     
             with tab2:
                 if not puts_df.empty:
                     display_puts = puts_df[['strike', 'lastPrice', 'openInterest', 'impliedVolatility']].copy()
                     display_puts.columns = ['行权价', '最新价', '未平仓', '隐波']
-                    st.dataframe(display_puts.style.format({
-                        '隐波': '{:.2%}', '最新价': '{:.2f}', '行权价': '{:.2f}', '未平仓': '{:,.0f}' 
-                    }), use_container_width=True)
+                    st.dataframe(display_puts.style.format({'隐波': '{:.2%}', '最新价': '{:.2f}', '行权价': '{:.2f}', '未平仓': '{:,.0f}'}), use_container_width=True)
                 else:
-                    st.info("当前无看跌期权数据")
+                    st.info("当前无看跌期权数据，可能受接口限制")
                 
         with d_col:
             st.subheader("🌑 大宗异动打印 (Dark Pool Print)")
@@ -242,4 +234,4 @@ if check_password():
         ), use_container_width=True)
 
     else:
-        st.error("⚠️ 数据加载失败。请更换 VPN 节点或稍后重试。")
+        st.error("⚠️ 发生未知错误，数据返回为空。")
