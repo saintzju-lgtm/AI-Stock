@@ -8,10 +8,54 @@ from plotly.subplots import make_subplots
 import time
 from datetime import datetime
 
-# --- 0. 页面全局配置 (必须放在第一行) ---
+# --- 0. 页面全局配置 ---
 st.set_page_config(layout="wide", page_title="专业量化决策终端")
 
-# --- 1. 核心量化引擎 (缓存改为 60 秒，配合 1 分钟自动刷新) ---
+# --- 新增：智能中英文模糊匹配引擎 ---
+TICKER_MAP = {
+    "苹果": "AAPL", "APPLE": "AAPL",
+    "特斯拉": "TSLA", "TESLA": "TSLA",
+    "英伟达": "NVDA", "NVIDIA": "NVDA",
+    "微软": "MSFT", "MICROSOFT": "MSFT",
+    "谷歌": "GOOG", "GOOGLE": "GOOG",
+    "亚马逊": "AMZN", "AMAZON": "AMZN",
+    "脸书": "META", "FACEBOOK": "META", "META": "META",
+    "比特小鹿": "BTDR", "BITDEER": "BTDR",
+    "阿里": "BABA", "阿里巴巴": "BABA", "ALIBABA": "BABA",
+    "腾讯": "TCEHY", "TENCENT": "TCEHY",
+    "京东": "JD", "拼多多": "PDD", "百度": "BIDU",
+    "蔚来": "NIO", "理想": "LI", "小鹏": "XPEV",
+    "台积电": "TSM", "超微半导体": "AMD", "AMD": "AMD",
+    "奈飞": "NFLX", "NETFLIX": "NFLX",
+    "微策略": "MSTR", "MICROSTRATEGY": "MSTR",
+    "COINBASE": "COIN", "MARATHON": "MARA", "RIOT": "RIOT",
+    "标普": "SPY", "纳指": "QQQ", "罗素": "IWM",
+    "博通": "AVGO", "高通": "QCOM", "英特尔": "INTC",
+    "阿斯麦": "ASML", "超微电脑": "SMCI", "安谋": "ARM",
+    "迪士尼": "DIS", "沃尔玛": "WMT", "礼来": "LLY", "诺和诺德": "NVO",
+    "帕兰泰尔": "PLTR", "PALANTIR": "PLTR",
+    "优步": "UBER", "爱彼迎": "ABNB", "哔哩哔哩": "BILI", "B站": "BILI",
+    "富途": "FUTU", "老虎": "TIGR", "贝壳": "BEKE"
+}
+
+def fuzzy_match_ticker(query):
+    query = query.strip().upper()
+    if not query: return "BTDR"
+    
+    # 1. 绝对匹配
+    if query in TICKER_MAP.values(): return query
+    if query in TICKER_MAP: return TICKER_MAP[query]
+        
+    # 2. 模糊包含匹配 (防单字母误伤，长度>=2才模糊)
+    if len(query) >= 2:
+        for name, ticker in TICKER_MAP.items():
+            if query in name:
+                return ticker
+                
+    # 3. 兜底：将用户输入当做原生态 Ticker
+    return query
+
+# --- 1. 核心量化引擎 ---
 @st.cache_data(ttl=60)
 def get_enhanced_market_data(ticker_symbol):
     try:
@@ -105,7 +149,7 @@ def get_enhanced_market_data(ticker_symbol):
     except Exception as e:
         return f"系统核心异常: {str(e)}"
 
-# --- 2. UI 渲染 (免密码直接加载) ---
+# --- 2. UI 渲染 ---
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; padding-bottom: 5px; } </style>""", unsafe_allow_html=True)
 
 # 侧边栏全局配置
@@ -113,10 +157,15 @@ if 'current_ticker' not in st.session_state:
     st.session_state.current_ticker = "BTDR"
 
 with st.sidebar:
-    st.markdown("### 添加新股票")
-    new_ticker = st.text_input("", value=st.session_state.current_ticker, label_visibility="collapsed")
-    if new_ticker and new_ticker.upper() != st.session_state.current_ticker:
-        st.session_state.current_ticker = new_ticker.upper()
+    st.markdown("### 🔍 切换股票")
+    # 获取用户输入
+    raw_input = st.text_input("支持中英文/拼音模糊搜索 (如 苹果/AAPL)", value=st.session_state.current_ticker)
+    
+    # 触发中英文模糊转换引擎
+    new_ticker = fuzzy_match_ticker(raw_input)
+    
+    if new_ticker and new_ticker != st.session_state.current_ticker:
+        st.session_state.current_ticker = new_ticker
         st.rerun() # 更改代码后立即刷新
     
     st.divider()
