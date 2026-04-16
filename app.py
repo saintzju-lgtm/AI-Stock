@@ -145,7 +145,7 @@ def get_enhanced_market_data(ticker_symbol):
         except: pass
 
         # 基础处理与指标计算
-        current_float = info.get('floatShares') or info.get('shares') or 118500000
+        current_float = info.get('floatShares') or info.get('shares') or 124000000
         hist.index = hist.index.date
         hist['昨收'] = hist['Close'].shift(1)
         hist['MA5'] = hist['Close'].rolling(5).mean()
