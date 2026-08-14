@@ -8,6 +8,9 @@ from plotly.subplots import make_subplots
 import time
 from datetime import datetime
 import threading
+import requests
+import pandas_datareader.data as web
+from curl_cffi import requests as cffi_requests
 
 # ==========================================
 # 0. 页面全局配置 (必须放在第一行)
@@ -19,7 +22,6 @@ st.set_page_config(layout="wide", page_title="专业量化决策终端")
 # ==========================================
 @st.cache_resource
 def get_global_api_state():
-    # 全局变量：所有访问该网页的用户共享这一个锁
     return {
         "last_real_request_time": 0.0,
         "lock": threading.Lock() 
@@ -27,7 +29,6 @@ def get_global_api_state():
 
 global_api_state = get_global_api_state()
 
-# 初始化单用户的本地惩罚状态
 if 'malicious_strikes' not in st.session_state:
     st.session_state.malicious_strikes = 0
 if 'user_penalty_until' not in st.session_state:
@@ -41,19 +42,17 @@ def verify_and_lock_request():
     """核准用户请求，拦截恶意高频与多用户并发"""
     now = time.time()
     
-    # 拦截层 1：检查该用户是否在“小黑屋”服刑
     if now < st.session_state.user_penalty_until:
         remaining = int(st.session_state.user_penalty_until - now)
         st.error(f"🛑 检测到恶意高频刷新！您的访问已被锁定，请等待 {remaining} 秒。")
         return False
 
-    # 拦截层 2：检查单用户连点频率 (间隔 < 3秒视为异常)
     time_since_last_click = now - st.session_state.last_user_click
     st.session_state.last_user_click = now
     
     if time_since_last_click < 3.0: 
         st.session_state.malicious_strikes += 1
-        if st.session_state.malicious_strikes >= 3: # 连点 3 次直接关小黑屋 60 秒
+        if st.session_state.malicious_strikes >= 3:
             st.session_state.user_penalty_until = now + 60.0
             st.session_state.malicious_strikes = 0
             st.error("🛑 警告：操作过于频繁，触发 60 秒惩罚锁定！")
@@ -62,79 +61,107 @@ def verify_and_lock_request():
             st.warning("⚠️ 请勿频繁点击，系统处理中...")
             return False
     else:
-        # 正常操作，逐渐恢复信用
         st.session_state.malicious_strikes = max(0, st.session_state.malicious_strikes - 1)
 
-    # 拦截层 3：全局 API 冷却锁 (限制全站每 5 秒最多接受 1 次新请求)
     with global_api_state["lock"]:
         if now - global_api_state["last_real_request_time"] < 5.0:
             st.info("⏳ 系统正在处理其他用户的排队请求，请 5 秒后再试。")
             return False
-        
-        # 准许放行，更新全局最后请求时间
         global_api_state["last_real_request_time"] = now
         return True
 
 # ==========================================
-# 🔍 2. 智能中英文模糊匹配引擎
+# 🔍 2. 动态加载全量美股库
 # ==========================================
-TICKER_MAP = {
-    "苹果": "AAPL", "特斯拉": "TSLA", "英伟达": "NVDA", "微软": "MSFT",
-    "谷歌": "GOOG", "亚马逊": "AMZN", "脸书": "META", "比特小鹿": "BTDR",
-    "阿里巴巴": "BABA", "腾讯": "TCEHY", "哔哩哔哩": "BILI", "B站": "BILI",
-    "比特": "BTC-USD", "纳指": "QQQ", "恐慌指数": "^VIX"
-}
+@st.cache_data(ttl=86400)
+def load_us_stock_library():
+    custom_library = [
+        "BTDR - 比特小鹿 (自选)", "AAPL - 苹果 (Apple Inc.)", "TSLA - 特斯拉 (Tesla)", 
+        "NVDA - 英伟达 (NVIDIA)", "MSFT - 微软 (Microsoft)", "GOOG - 谷歌 (Alphabet)", 
+        "BTC-USD - 比特币 (Bitcoin)", "QQQ - 纳指ETF", "^VIX - 恐慌指数",
+        "000409.SZ - 云鼎科技", "600325.SS - 华发股份"
+    ]
+    
+    try:
+        headers = {'User-Agent': 'Quant-Terminal-App/1.0 (admin@example.com)'}
+        res = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=5)
+        data = res.json()
+        us_stocks = [f"{item['ticker']} - {item['title'].title()}" for item in data.values()]
+        return custom_library + [s for s in us_stocks if s.split(" - ")[0] not in [c.split(" - ")[0] for c in custom_library]]
+    except Exception:
+        return custom_library + [
+            "AMZN - Amazon", "META - Meta Platforms", "BABA - Alibaba", 
+            "TCEHY - Tencent", "BILI - Bilibili"
+        ]
 
-def fuzzy_match_ticker(query):
-    query = query.strip().upper()
-    if not query: return "BTDR"
-    if query in TICKER_MAP.values(): return query
-    if query in TICKER_MAP: return TICKER_MAP[query]
-    if len(query) >= 2:
-        for name, ticker in TICKER_MAP.items():
-            if query in name: return ticker
-    return query
+STOCK_LIBRARY = load_us_stock_library()
 
 # ==========================================
-# ⚙️ 3. 核心量化引擎 (依赖官方防爬 + 滴水节流)
+# ⚙️ 3. 核心量化引擎 (双源智能切换 + 防封锁)
 # ==========================================
-@st.cache_data(ttl=300) # 5分钟长效缓存，防恶意 F5 刷新
+@st.cache_data(ttl=300)
 def get_enhanced_market_data(ticker_symbol):
     try:
-        time.sleep(1) # 轻微延迟，防止触发底层并发拦截
-        tk = yf.Ticker(ticker_symbol)
-        info = tk.info
-        hist = tk.history(period="100d", interval="1d")
+        hist = pd.DataFrame()
+        info = {}
         
-        if hist.empty: return "数据源返回为空，请检查股票代码或等待接口恢复。"
+        # --- 抓取尝试 1: Yahoo Finance + TLS 指纹伪造 ---
+        try:
+            session = cffi_requests.Session(impersonate="chrome110")
+            tk = yf.Ticker(ticker_symbol, session=session)
+            hist = tk.history(period="100d", interval="1d")
+            try: info = tk.info
+            except: info = {}
+        except Exception:
+            hist = pd.DataFrame()
 
-        # 容错获取宏观数据
+        # --- 抓取尝试 2: 兜底数据源 Stooq (对云端 IP 极友好) ---
+        if hist.empty:
+            try:
+                stooq_code = f"{ticker_symbol}.US" if "^" not in ticker_symbol and "." not in ticker_symbol else ticker_symbol
+                hist = web.DataReader(stooq_code, 'stooq').head(100)
+                hist = hist.sort_index()
+            except Exception:
+                pass
+
+        if hist.empty:
+            return "所有数据源访问均失败，可能触发频繁限制，请稍后再试。"
+
+        # 宏观指标辅助函数
         def safe_get_macro(sym):
             try:
-                t = yf.Ticker(sym)
-                p = t.fast_info['last_price']
-                time.sleep(0.5) # 滴水式节流
-                return p, (p / t.fast_info['previous_close'] - 1)
-            except: return 0.0, 0.0
+                m_df = web.DataReader(f"{sym}.US" if sym=="^IXIC" else sym, 'stooq').head(2)
+                if not m_df.empty and len(m_df) >= 2:
+                    p = m_df['Close'].iloc[-1]
+                    p_prev = m_df['Close'].iloc[-2]
+                    return p, (p / p_prev - 1)
+            except Exception:
+                pass
+            return 0.0, 0.0
 
         btc, _ = safe_get_macro("BTC-USD")
         nasdaq, nasdaq_pct = safe_get_macro("^IXIC")
         vix, vix_pct = safe_get_macro("^VIX")
 
-        # 期权链处理
+        # 期权数据抓取 (若被封自动容错置空)
         calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
-        current_exp = "N/A"
+        current_exp, pcr_value = "N/A", "N/A"
         try:
-            exp_dates = tk.options
+            session = cffi_requests.Session(impersonate="chrome110")
+            tk_opt = yf.Ticker(ticker_symbol, session=session)
+            exp_dates = tk_opt.options
             if exp_dates:
                 today_str = datetime.now().strftime('%Y-%m-%d')
                 current_exp = exp_dates[1] if (exp_dates[0] <= today_str and len(exp_dates) > 1) else exp_dates[0]
-                
-                time.sleep(0.5) # 滴水式节流
-                opt_data = tk.option_chain(current_exp)
+                opt_data = tk_opt.option_chain(current_exp)
                 curr_p = hist['Close'].iloc[-1]
                 
-                # ATM 中心化切片
+                try:
+                    total_calls = opt_data.calls['openInterest'].sum()
+                    total_puts = opt_data.puts['openInterest'].sum()
+                    if total_calls > 0: pcr_value = total_puts / total_calls
+                except: pass
+
                 for df_type in ['calls', 'puts']:
                     df = getattr(opt_data, df_type)
                     if not df.empty:
@@ -142,11 +169,18 @@ def get_enhanced_market_data(ticker_symbol):
                         slice_df = df.iloc[max(0, idx-4) : min(len(df), idx+5)]
                         if df_type == 'calls': calls_df = slice_df
                         else: puts_df = slice_df
-        except: pass
+        except Exception:
+            pass
 
-        # 基础处理与指标计算
-        current_float = info.get('floatShares') or info.get('shares') or 124000000
-        hist.index = hist.index.date
+        # 流通股矫正
+        if ticker_symbol in ["BTDR", "比特小鹿"]:
+            current_float = 123715025
+        else:
+            current_float = info.get('floatShares') if info else 100000000
+            if not current_float: current_float = 100000000
+
+        # 数据清洗与指标计算
+        hist.index = pd.to_datetime(hist.index).date
         hist['昨收'] = hist['Close'].shift(1)
         hist['MA5'] = hist['Close'].rolling(5).mean()
         hist['MA20'] = hist['Close'].rolling(20).mean()
@@ -160,12 +194,12 @@ def get_enhanced_market_data(ticker_symbol):
         mfr = pd.Series(np.where(tp > tp.shift(1), rmf, 0)).rolling(14).sum() / pd.Series(np.where(tp < tp.shift(1), rmf, 0)).rolling(14).sum()
         hist['MFI'] = 100 - (100 / (1 + mfr.values))
 
-        # 大宗/暗池识别
+        # 暗池/大宗信号
         avg_vol = hist['Volume'].mean()
         dark = hist[hist['Volume'] > avg_vol * 1.2].tail(8).copy()
         dark['Signal'] = dark.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
 
-        # 场景回归预测模型
+        # 线性回归预测
         fit_df = hist.dropna()
         X = ((fit_df['Open'] - fit_df['昨收']) / fit_df['昨收']).values.reshape(-1, 1)
         reg_params = {}
@@ -176,11 +210,10 @@ def get_enhanced_market_data(ticker_symbol):
         return hist, reg_params, calls_df, puts_df, dark, {
             'btc': btc, 'nasdaq': nasdaq, 'nasdaq_pct': nasdaq_pct, 
             'vix': vix, 'vix_pct': vix_pct, 'float': current_float, 
-            'volume': info.get('regularMarketVolume', 0), 'exp': current_exp
+            'volume': hist['Volume'].iloc[-1] if not hist.empty else 0, 
+            'exp': current_exp, 'pcr': pcr_value
         }
     except Exception as e:
-        if "429" in str(e) or "Too Many Requests" in str(e):
-            return "IP 已被 Yahoo 封锁 (HTTP 429)。请彻底更换 VPN 节点并清理缓存后再试。"
         return f"系统核心异常: {str(e)}"
 
 # ==========================================
@@ -189,24 +222,31 @@ def get_enhanced_market_data(ticker_symbol):
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; } </style>""", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.markdown("### 🔍 切换股票")
-    raw_input = st.text_input("支持中英文模糊搜索", value=st.session_state.current_ticker)
-    new_tk = fuzzy_match_ticker(raw_input)
+    default_idx = 0
+    for i, item in enumerate(STOCK_LIBRARY):
+        if item.startswith(st.session_state.current_ticker + " -"):
+            default_idx = i
+            break
+            
+    selected_item = st.selectbox(
+        "搜索股票",
+        options=STOCK_LIBRARY,
+        index=default_idx,
+        placeholder="例如: BTDR 或 AAPL"
+    )
     
-    # 检测到输入了新的股票代码
+    new_tk = selected_item.split(" - ")[0].strip()
     if new_tk and new_tk != st.session_state.current_ticker:
-        # 👉 触发第一重防刷验证 (必须通过才能更换)
         if verify_and_lock_request():
             st.session_state.current_ticker = new_tk
             st.rerun()
             
     st.divider()
-    auto_refresh = st.checkbox("开启 5分钟自动无感刷新", value=True)
+    auto_refresh = st.checkbox("开启 5分钟自动刷新", value=False)
 
 ticker = st.session_state.current_ticker
 st.title(f"🎯 {ticker} 专业量化决策终端")
 
-# 提取数据 (带有 @st.cache_data 的保护)
 data = get_enhanced_market_data(ticker)
 
 if isinstance(data, str):
@@ -215,16 +255,16 @@ elif data:
     hist_df, reg, calls_df, puts_df, dark_df, mkt = data
     last = hist_df.iloc[-1]
     
-    # --- 全球宏观看板 ---
+    # 全球宏观看板
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Bitcoin", f"${mkt['btc']:,.0f}" if mkt['btc'] > 0 else "N/A")
     m2.metric("Nasdaq", f"{mkt['nasdaq']:,.2f}" if mkt['nasdaq'] > 0 else "N/A", f"{mkt['nasdaq_pct']:.2%}")
     m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}" if mkt['vix'] > 0 else "N/A", f"{mkt['vix_pct']:.2%}", delta_color="inverse")
-    m4.metric(f"{ticker} 现价", f"${last['Close']:.2f}", f"{(last['Close']/last['昨收']-1):.2%}")
+    m4.metric(f"{ticker} 现价", f"${last['Close']:.2f}", f"{(last['Close']/last['昨收']-1):.2%}" if pd.notnull(last['昨收']) else "N/A")
 
     st.divider()
     
-    # --- 实时指标与回归 ---
+    # 实时指标与场景回归
     c1, c2 = st.columns([1, 1.5])
     with c1:
         st.subheader("📊 实时指标")
@@ -234,7 +274,7 @@ elif data:
         st.write(f"资金 MFI: **{last['MFI']:.2f}**")
     with c2:
         st.subheader("📍 场景回归预测")
-        ratio_o = (last['Open'] - last['昨收']) / last['昨收']
+        ratio_o = (last['Open'] - last['昨收']) / last['昨收'] if last['昨收'] > 0 else 0
         p_h = last['昨收'] * (1 + (reg['i_h'] + reg['s_h'] * ratio_o))
         p_l = last['昨收'] * (1 + (reg['i_l'] + reg['s_l'] * ratio_o))
         st.table(pd.DataFrame({
@@ -243,11 +283,11 @@ elif data:
             "支撑参考": [p_l*1.06, p_l, p_l*0.94]
         }).style.format(precision=2))
 
-    # --- 走势主图 ---
+    # K 线与成交量图表
     st.divider()
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
     p_df = hist_df.tail(40).copy()
-    p_df['label'] = pd.to_datetime(p_df.index).strftime('%m-%d')
+    p_df['label'] = pd.to_datetime(p_df.index).dt.strftime('%m-%d')
     
     fig.add_trace(go.Scatter(x=p_df['label'], y=p_df['Upper'], line=dict(color='rgba(0,102,204,0.3)'), name=f"High:{last['Upper']:.2f}"), row=1, col=1)
     fig.add_trace(go.Scatter(x=p_df['label'], y=p_df['Lower'], line=dict(color='rgba(0,102,204,0.3)'), fill='tonexty', name=f"Low:{last['Lower']:.2f}"), row=1, col=1)
@@ -257,27 +297,28 @@ elif data:
     colors = ['#E53935' if (p_df['Close'].iloc[i] >= p_df['Open'].iloc[i]) else '#43A047' for i in range(len(p_df))]
     fig.add_trace(go.Bar(x=p_df['label'], y=p_df['换手率_raw']*100, marker_color=colors, name="换手%"), row=2, col=1)
     
-    fig.update_layout(height=600, xaxis_rangeslider_visible=False, template="plotly_white")
+    fig.update_layout(height=500, xaxis_rangeslider_visible=False, template="plotly_white", dragmode=False)
     fig.update_xaxes(type='category', tickmode='linear', dtick=1, tickangle=-90)
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- 期权链与暗池 ---
+    # 期权与大宗交易
     st.divider()
     o_col, d_col = st.columns(2)
     with o_col:
-        st.subheader(f"🕯️ 全景期权 (到期:{mkt['exp']})")
+        pcr_display = f" | PCR: {mkt['pcr']:.2f}" if isinstance(mkt.get('pcr'), (float, int)) else ""
+        st.subheader(f"🕯️ 全景期权 (到期:{mkt['exp']}{pcr_display})")
         t1, t2 = st.tabs(["📈 看涨 (Calls)", "📉 看跌 (Puts)"])
         
         with t1: 
             if not calls_df.empty: 
                 st.dataframe(calls_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
             else: 
-                st.info("受接口频控限制或暂无数据")
+                st.info("期权接口受云端限流保护，暂不显示")
         with t2: 
             if not puts_df.empty: 
                 st.dataframe(puts_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
             else: 
-                st.info("受接口频控限制或暂无数据")
+                st.info("期权接口受云端限流保护，暂不显示")
             
     with d_col:
         st.subheader("🌑 大宗异动打印 (Dark Pool)")
@@ -286,13 +327,12 @@ elif data:
         else: 
             st.info("近期无显著异动")
 
-    # --- 历史明细 ---
+    # 历史数据表
     st.subheader("📋 历史明细")
     hist_show = hist_df.tail(15).copy()
     hist_show['换手'] = (hist_show['换手率_raw'] * 100).map('{:.2f}%'.format)
     st.dataframe(hist_show[['Open','High','Low','Close','换手','MFI','MA20','MA5']].style.format(precision=2), use_container_width=True)
 
-    # --- 无感自动刷新逻辑 ---
     if auto_refresh:
-        time.sleep(300) # 等待 5 分钟
-        st.rerun()      # 触发页面重载 (会直接读取最新缓存，不会触发恶意验证)
+        time.sleep(300)
+        st.rerun()
