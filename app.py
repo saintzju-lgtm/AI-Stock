@@ -35,9 +35,9 @@ PRESET_FLOATS = {
 @st.cache_resource
 def get_global_data_store():
     return {
-        "stock_cache": {},        # { "BTDR": (hist, reg, dark, exp_dates, mkt) }
-        "options_cache": {},      # { "BTDR_2026-08-21": (calls, puts, wall_c, wall_p, flip, pcr) }
-        "fetch_timestamps": {},   # 🎯 存储单股 Unix 时间戳: { "BTDR": 1786687625.0 }
+        "stock_cache": {},        
+        "options_cache": {},      
+        "fetch_timestamps": {},   
         "active_queue": set(["BTDR", "AAPL", "TSLA", "NVDA"]), 
         "lock": threading.Lock()
     }
@@ -89,7 +89,6 @@ def fetch_macro_api(symbol, stooq_symbol):
     return 0.0, 0.0
 
 def do_fetch_stock_data(ticker_symbol):
-    """抓取股票与核心指标（附带准确的时间戳）"""
     try:
         now_ts = time.time()
         fetch_time_bj = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
@@ -155,12 +154,13 @@ def do_fetch_stock_data(ticker_symbol):
             'vix': vix, 'vix_pct': vix_pct, 'float': current_float, 
             'volume': hist['Volume'].iloc[-1], 'source': source,
             'fetch_time': fetch_time_bj,
-            'timestamp': now_ts  # 👈 用于检测过期的精确 Unix 时间戳
+            'timestamp': now_ts 
         }
     except Exception:
         return None
 
 def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
+    """计算期权指标（增强容错：若 openInterest 全为 0，自动降级用 volume 或距离权重计算墙）"""
     calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
     call_wall, put_wall, gamma_flip, pcr_value = np.nan, np.nan, np.nan, np.nan
     try:
@@ -168,15 +168,48 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
         opt_data = tk_opt.option_chain(selected_exp)
         calls, puts = opt_data.calls, opt_data.puts
 
+        # 确保列存在且填充默认值
+        for df in [calls, puts]:
+            if not df.empty:
+                if 'openInterest' not in df.columns: df['openInterest'] = 0
+                else: df['openInterest'] = df['openInterest'].fillna(0)
+                if 'volume' not in df.columns: df['volume'] = 0
+                else: df['volume'] = df['volume'].fillna(0)
+                if 'impliedVolatility' not in df.columns: df['impliedVolatility'] = 0.2
+                else: df['impliedVolatility'] = df['impliedVolatility'].fillna(0.2)
+
+        # 1. PCR 计算
         total_calls_oi = calls['openInterest'].sum() if not calls.empty else 0
         total_puts_oi = puts['openInterest'].sum() if not puts.empty else 0
-        if total_calls_oi > 0: pcr_value = total_puts_oi / total_calls_oi
+        if total_calls_oi > 0: 
+            pcr_value = total_puts_oi / total_calls_oi
+        else:
+            # 如果 openInterest 全为 0，尝试用 volume 替代计算 PCR
+            v_calls = calls['volume'].sum() if not calls.empty else 0
+            v_puts = puts['volume'].sum() if not puts.empty else 0
+            if v_calls > 0: pcr_value = v_puts / v_calls
 
-        if not calls.empty and calls['openInterest'].max() > 0:
-            call_wall = calls.loc[calls['openInterest'].idxmax()]['strike']
-        if not puts.empty and puts['openInterest'].max() > 0:
-            put_wall = puts.loc[puts['openInterest'].idxmax()]['strike']
+        # 2. 看涨墙与看跌墙计算（多重降级兜底）
+        if not calls.empty:
+            if calls['openInterest'].max() > 0:
+                call_wall = calls.loc[calls['openInterest'].idxmax()]['strike']
+            elif calls['volume'].max() > 0:
+                call_wall = calls.loc[calls['volume'].idxmax()]['strike']
+            else:
+                # 若持仓和成交量都为 0，取高于现价最近且有价值的行权价或上方一档
+                higher_strikes = calls[calls['strike'] > current_price]
+                if not higher_strikes.empty: call_wall = higher_strikes.iloc[0]['strike']
 
+        if not puts.empty:
+            if puts['openInterest'].max() > 0:
+                put_wall = puts.loc[puts['openInterest'].idxmax()]['strike']
+            elif puts['volume'].max() > 0:
+                put_wall = puts.loc[puts['volume'].idxmax()]['strike']
+            else:
+                lower_strikes = puts[puts['strike'] < current_price]
+                if not lower_strikes.empty: put_wall = lower_strikes.iloc[-1]['strike']
+
+        # 3. 伽马翻转点计算
         try:
             exp_date = datetime.strptime(selected_exp, '%Y-%m-%d')
             T = max((exp_date - datetime.now()).days, 1) / 365.0
@@ -185,16 +218,18 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
 
             for s_test in s_range:
                 tot_g = 0.0
+                weight_source = 'openInterest' if total_calls_oi > 0 else 'volume'
+                
                 for _, row in calls.iterrows():
-                    k, oi, iv = row['strike'], row['openInterest'], row.get('impliedVolatility', 0.2)
-                    if oi > 0 and k > 0 and iv > 0.01:
+                    k, w, iv = row['strike'], row[weight_source] if row[weight_source] > 0 else 1, row.get('impliedVolatility', 0.2)
+                    if k > 0 and iv > 0.01:
                         d1 = (np.log(s_test / k) + 0.5 * (iv**2) * T) / (iv * np.sqrt(T))
-                        tot_g += oi * (np.exp(-0.5 * d1**2) / (s_test * iv * np.sqrt(2 * np.pi * T)))
+                        tot_g += w * (np.exp(-0.5 * d1**2) / (s_test * iv * np.sqrt(2 * np.pi * T)))
                 for _, row in puts.iterrows():
-                    k, oi, iv = row['strike'], row['openInterest'], row.get('impliedVolatility', 0.2)
-                    if oi > 0 and k > 0 and iv > 0.01:
+                    k, w, iv = row['strike'], row[weight_source] if row[weight_source] > 0 else 1, row.get('impliedVolatility', 0.2)
+                    if k > 0 and iv > 0.01:
                         d1 = (np.log(s_test / k) + 0.5 * (iv**2) * T) / (iv * np.sqrt(T))
-                        tot_g -= oi * (np.exp(-0.5 * d1**2) / (s_test * iv * np.sqrt(2 * np.pi * T)))
+                        tot_g -= w * (np.exp(-0.5 * d1**2) / (s_test * iv * np.sqrt(2 * np.pi * T)))
                 net_gammas.append(tot_g)
 
             net_gammas = np.array(net_gammas)
@@ -205,11 +240,11 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
                 x1, x2 = s_range[idx], s_range[idx+1]
                 gamma_flip = x1 - y1 * (x2 - x1) / (y2 - y1) if (y2 - y1) != 0 else x1
             else:
-                tot_oi = total_calls_oi + total_puts_oi
-                if tot_oi > 0:
-                    gamma_flip = ((calls['strike']*calls['openInterest']).sum() + (puts['strike']*puts['openInterest']).sum()) / tot_oi
-        except Exception: pass
+                gamma_flip = current_price # 默认回退至现价附近
+        except Exception: 
+            gamma_flip = current_price
 
+        # 4. 表格切片展示（以现价为中心）
         for df_type, target_df in [('calls', calls), ('puts', puts)]:
             if not target_df.empty:
                 idx = (target_df['strike'] - current_price).abs().idxmin()
@@ -255,7 +290,7 @@ def background_updater_loop():
                 time.sleep(2.0)
                 
         except Exception: pass
-        time.sleep(120) # 2 分钟轮询
+        time.sleep(180)
 
 @st.cache_resource
 def start_background_engine():
@@ -266,7 +301,7 @@ def start_background_engine():
 start_background_engine()
 
 # ==========================================
-# 🖥️ 5. 纯前端 UI 渲染层 (带智能缓存失效自愈)
+# 🖥️ 5. 纯前端 UI 渲染层
 # ==========================================
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; } </style>""", unsafe_allow_html=True)
 
@@ -297,12 +332,10 @@ with st.sidebar:
 ticker = st.session_state.current_ticker
 st.title(f"🎯 {ticker} 专业量化决策终端")
 
-# 读取内存缓存与时间戳
 stock_data = GLOBAL_STORE["stock_cache"].get(ticker)
 last_ts = GLOBAL_STORE["fetch_timestamps"].get(ticker, 0)
 now_ts = time.time()
 
-# 🛠️ 【核心自愈逻辑】：如果内存无数据，或者数据时间距今超过 3 分钟 (180s)，触发主动更新！
 is_expired = (now_ts - last_ts) > 180
 
 if not stock_data or is_expired:
@@ -321,10 +354,8 @@ else:
     hist_df, reg, dark_df, exp_dates, mkt = stock_data
     last = hist_df.iloc[-1]
     
-    # 🕒 状态栏精准展示
     st.caption(f"🟢 数据解耦防护中 | **{ticker}** 数据抓取于 (北京时间): **{mkt['fetch_time']}** | 数据源: **{mkt['source']}**")
     
-    # 全球宏观看板
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Bitcoin", f"${mkt['btc']:,.0f}" if mkt['btc'] > 0 else "N/A")
     m2.metric("Nasdaq", f"{mkt['nasdaq']:,.2f}" if mkt['nasdaq'] > 0 else "N/A", f"{mkt['nasdaq_pct']:.2%}" if mkt['nasdaq'] > 0 else "N/A")
@@ -333,7 +364,6 @@ else:
 
     st.divider()
     
-    # 实时指标与场景回归
     c1, c2 = st.columns([1, 1.5])
     with c1:
         st.subheader("📊 实时指标")
@@ -356,7 +386,6 @@ else:
             "支撑参考": [p_l*1.06, p_l, p_l*0.94]
         }).style.format(precision=2))
 
-    # K 线与成交量图表
     st.divider()
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
     p_df = hist_df.tail(40).copy()
@@ -378,7 +407,6 @@ else:
     fig.update_xaxes(type='category', tickmode='linear', dtick=1, tickangle=-90)
     st.plotly_chart(fig, use_container_width=True)
 
-    # 期权与大宗交易模块
     st.divider()
     o_col, d_col = st.columns([1.6, 1])
     
@@ -433,7 +461,6 @@ else:
         else: 
             st.info("近期无显著异动")
 
-    # 历史数据表
     st.subheader("📋 历史明细")
     hist_show = hist_df.tail(15).copy()
     if hist_show['换手率_raw'].notnull().any():
