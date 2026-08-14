@@ -19,7 +19,6 @@ st.set_page_config(layout="wide", page_title="专业量化决策终端")
 # 定义北京时间 (UTC+8)
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-# 精确股本字典 (单位：股)
 PRESET_FLOATS = {
     "BTDR": 123715025,
     "AAPL": 15200000000,
@@ -36,8 +35,9 @@ PRESET_FLOATS = {
 @st.cache_resource
 def get_global_data_store():
     return {
-        "stock_cache": {},        # 结构: { "BTDR": (hist, reg, dark, exp_dates, mkt) }
-        "options_cache": {},      # 结构: { "BTDR_2026-08-21": (calls, puts, wall_c, wall_p, flip, pcr) }
+        "stock_cache": {},        # { "BTDR": (hist, reg, dark, exp_dates, mkt) }
+        "options_cache": {},      # { "BTDR_2026-08-21": (calls, puts, wall_c, wall_p, flip, pcr) }
+        "fetch_timestamps": {},   # 🎯 存储单股 Unix 时间戳: { "BTDR": 1786687625.0 }
         "active_queue": set(["BTDR", "AAPL", "TSLA", "NVDA"]), 
         "lock": threading.Lock()
     }
@@ -89,10 +89,10 @@ def fetch_macro_api(symbol, stooq_symbol):
     return 0.0, 0.0
 
 def do_fetch_stock_data(ticker_symbol):
-    """抓取股票与核心指标（附带准确的北京时间戳）"""
+    """抓取股票与核心指标（附带准确的时间戳）"""
     try:
-        # 🎯 记录本次抓取的准确北京时间
-        fetch_time_bj = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
+        now_ts = time.time()
+        fetch_time_bj = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
         hist = pd.DataFrame()
         info = {}
@@ -154,13 +154,13 @@ def do_fetch_stock_data(ticker_symbol):
             'btc': btc, 'nasdaq': nasdaq, 'nasdaq_pct': nasdaq_pct, 
             'vix': vix, 'vix_pct': vix_pct, 'float': current_float, 
             'volume': hist['Volume'].iloc[-1], 'source': source,
-            'fetch_time': fetch_time_bj  # 👈 精确打标抓取时刻
+            'fetch_time': fetch_time_bj,
+            'timestamp': now_ts  # 👈 用于检测过期的精确 Unix 时间戳
         }
     except Exception:
         return None
 
 def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
-    """计算期权指标"""
     calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
     call_wall, put_wall, gamma_flip, pcr_value = np.nan, np.nan, np.nan, np.nan
     try:
@@ -235,6 +235,7 @@ def background_updater_loop():
                     if data:
                         with GLOBAL_STORE["lock"]:
                             GLOBAL_STORE["stock_cache"][ticker] = data
+                            GLOBAL_STORE["fetch_timestamps"][ticker] = data[4]['timestamp']
                         
                         hist_df, _, _, exp_dates, _ = data
                         last_price = hist_df['Close'].iloc[-1]
@@ -254,7 +255,7 @@ def background_updater_loop():
                 time.sleep(2.0)
                 
         except Exception: pass
-        time.sleep(180)
+        time.sleep(120) # 2 分钟轮询
 
 @st.cache_resource
 def start_background_engine():
@@ -265,7 +266,7 @@ def start_background_engine():
 start_background_engine()
 
 # ==========================================
-# 🖥️ 5. 纯前端 UI 渲染层
+# 🖥️ 5. 纯前端 UI 渲染层 (带智能缓存失效自愈)
 # ==========================================
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; } </style>""", unsafe_allow_html=True)
 
@@ -296,16 +297,22 @@ with st.sidebar:
 ticker = st.session_state.current_ticker
 st.title(f"🎯 {ticker} 专业量化决策终端")
 
-# 读取内存缓存
+# 读取内存缓存与时间戳
 stock_data = GLOBAL_STORE["stock_cache"].get(ticker)
+last_ts = GLOBAL_STORE["fetch_timestamps"].get(ticker, 0)
+now_ts = time.time()
 
-# 紧急同步兜底
-if not stock_data:
-    with st.spinner(f"🚀 首次加载 {ticker}，正在紧急同步数据..."):
-        stock_data = do_fetch_stock_data(ticker)
-        if stock_data:
+# 🛠️ 【核心自愈逻辑】：如果内存无数据，或者数据时间距今超过 3 分钟 (180s)，触发主动更新！
+is_expired = (now_ts - last_ts) > 180
+
+if not stock_data or is_expired:
+    with st.spinner(f"🔄 正在同步 **{ticker}** 最新市场数据..."):
+        fresh_data = do_fetch_stock_data(ticker)
+        if fresh_data:
+            stock_data = fresh_data
             with GLOBAL_STORE["lock"]:
-                GLOBAL_STORE["stock_cache"][ticker] = stock_data
+                GLOBAL_STORE["stock_cache"][ticker] = fresh_data
+                GLOBAL_STORE["fetch_timestamps"][ticker] = fresh_data[4]['timestamp']
                 GLOBAL_STORE["active_queue"].add(ticker)
 
 if not stock_data:
@@ -314,7 +321,7 @@ else:
     hist_df, reg, dark_df, exp_dates, mkt = stock_data
     last = hist_df.iloc[-1]
     
-    # 🕒 展示该股票精准的抓取时刻（北京时间）
+    # 🕒 状态栏精准展示
     st.caption(f"🟢 数据解耦防护中 | **{ticker}** 数据抓取于 (北京时间): **{mkt['fetch_time']}** | 数据源: **{mkt['source']}**")
     
     # 全球宏观看板
@@ -390,7 +397,7 @@ else:
             
             opt_key = f"{ticker}_{selected_exp}"
             opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
-            if not opt_data:
+            if not opt_data or is_expired:
                 opt_data = do_fetch_option_details(ticker, selected_exp, last['Close'])
                 if opt_data:
                     with GLOBAL_STORE["lock"]:
