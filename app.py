@@ -10,14 +10,13 @@ from datetime import datetime, timezone, timedelta
 import threading
 import requests
 import pandas_datareader.data as web
-from curl_cffi import requests as cffi_requests  # 👈 利用这个库伪造真实浏览器指纹
+from curl_cffi import requests as cffi_requests
 
 # ==========================================
 # 0. 页面全局配置与时区定义
 # ==========================================
 st.set_page_config(layout="wide", page_title="专业量化决策终端")
 
-# 定义北京时间 (UTC+8)
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 PRESET_FLOATS = {
@@ -160,38 +159,22 @@ def do_fetch_stock_data(ticker_symbol):
     except Exception:
         return None
 
-
-# 🎯 核心黑科技：伪造浏览器获取 Crumb 穿透请求期权
 def get_raw_options_with_crumb(ticker_symbol, selected_exp):
     try:
-        # 使用 curl_cffi 模拟真实 Chrome 浏览器，规避 AWS IP 的 TLS 封锁
         session = cffi_requests.Session(impersonate="chrome110")
-        
-        # 1. 访问主页种下 Cookie
         session.get("https://fc.yahoo.com", timeout=5)
-        
-        # 2. 提取动态 Crumb 令牌
         crumb = session.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=5).text.strip()
-        
-        # 3. 将到期日转换为 Unix 时间戳
         exp_ts = int(datetime.strptime(selected_exp, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp())
-        
-        # 4. 携带 Cookie + Crumb 请求官方 V7 接口
         url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker_symbol}?date={exp_ts}&crumb={crumb}"
         res = session.get(url, timeout=5)
-        
         if res.status_code == 200:
             data = res.json()
             options = data['optionChain']['result'][0].get('options', [{}])[0]
-            
             calls = pd.DataFrame(options.get('calls', []))
             puts = pd.DataFrame(options.get('puts', []))
             return calls, puts
-    except Exception:
-        pass
-    
+    except Exception: pass
     return pd.DataFrame(), pd.DataFrame()
-
 
 def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
     calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
@@ -199,10 +182,8 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
     has_valid_oi = False
 
     try:
-        # 👉 替换点：不再依赖易被清零的 yfinance，直接用我们写的底层穿透函数抓取
         calls, puts = get_raw_options_with_crumb(ticker_symbol, selected_exp)
 
-        # 确保列存在且填充默认值
         for df in [calls, puts]:
             if not df.empty:
                 if 'openInterest' not in df.columns: df['openInterest'] = 0
@@ -299,7 +280,7 @@ def background_updater_loop():
                         hist_df, _, _, exp_dates, _ = data
                         last_price = hist_df['Close'].iloc[-1]
                         today_str = datetime.now().strftime('%Y-%m-%d')
-                        future_exps = [ed for ed in exp_dates if ed >= today_str][:2]
+                        future_exps = [ed for ed in exp_dates if ed > today_str][:2] # 👈 避开 0DTE
                         
                         for exp_date in future_exps:
                             try:
@@ -440,8 +421,10 @@ else:
         if exp_dates:
             today_str = datetime.now().strftime('%Y-%m-%d')
             default_exp_idx = 0
+            
+            # 👉 【关键修改】：避开今天到期的 0DTE，优先定位到下一个周期的到期日
             for idx, ed in enumerate(exp_dates):
-                if ed >= today_str:
+                if ed > today_str:
                     default_exp_idx = idx
                     break
             
@@ -459,7 +442,7 @@ else:
                 calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_val, has_valid_oi = opt_data
                 
                 if not has_valid_oi:
-                    st.warning("⚠️ 提示：数据源当前删减了该到期日的持仓量 (OI=0)。为防止错误的做市商指标误导决策，已暂停“墙”与 Gamma 指标计算。")
+                    st.warning("⚠️ 提示：当前选择的到期日属于末日交割期权 (0DTE) 或清算中，持仓量 (OI=0)。建议在上方下拉菜单中选择下一个周期的到期日进行分析。")
 
                 q1, q2, q3, q4 = st.columns(4)
                 q1.metric("🧱 看涨墙 (Call Wall)", f"${call_wall:.2f}" if pd.notnull(call_wall) else "N/A")
