@@ -39,7 +39,6 @@ def get_global_data_store():
         "stock_cache": {},        # 结构: { "BTDR": (hist, reg, dark, exp_dates, mkt) }
         "options_cache": {},      # 结构: { "BTDR_2026-08-21": (calls, puts, wall_c, wall_p, flip, pcr) }
         "active_queue": set(["BTDR", "AAPL", "TSLA", "NVDA"]), 
-        "last_updated": 0,
         "lock": threading.Lock()
     }
 
@@ -90,8 +89,11 @@ def fetch_macro_api(symbol, stooq_symbol):
     return 0.0, 0.0
 
 def do_fetch_stock_data(ticker_symbol):
-    """抓取股票与核心指标"""
+    """抓取股票与核心指标（附带准确的北京时间戳）"""
     try:
+        # 🎯 记录本次抓取的准确北京时间
+        fetch_time_bj = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
+
         hist = pd.DataFrame()
         info = {}
         source = "Yahoo Finance"
@@ -151,7 +153,8 @@ def do_fetch_stock_data(ticker_symbol):
         return hist, reg_params, dark, exp_dates, {
             'btc': btc, 'nasdaq': nasdaq, 'nasdaq_pct': nasdaq_pct, 
             'vix': vix, 'vix_pct': vix_pct, 'float': current_float, 
-            'volume': hist['Volume'].iloc[-1], 'source': source
+            'volume': hist['Volume'].iloc[-1], 'source': source,
+            'fetch_time': fetch_time_bj  # 👈 精确打标抓取时刻
         }
     except Exception:
         return None
@@ -249,9 +252,6 @@ def background_updater_loop():
 
                 except Exception: pass
                 time.sleep(2.0)
-            
-            with GLOBAL_STORE["lock"]:
-                GLOBAL_STORE["last_updated"] = time.time()
                 
         except Exception: pass
         time.sleep(180)
@@ -314,14 +314,8 @@ else:
     hist_df, reg, dark_df, exp_dates, mkt = stock_data
     last = hist_df.iloc[-1]
     
-    # 🕒 【时区转换修正】：精确计算北京时间展示
-    if GLOBAL_STORE["last_updated"] > 0:
-        updated_dt = datetime.fromtimestamp(GLOBAL_STORE["last_updated"], tz=timezone.utc).astimezone(BEIJING_TZ)
-    else:
-        updated_dt = datetime.now(BEIJING_TZ)
-    
-    beijing_time_str = updated_dt.strftime('%H:%M:%S')
-    st.caption(f"🟢 数据解耦防护中 | 内存缓存更新于 (北京时间): **{beijing_time_str}** | 数据源: **{mkt['source']}**")
+    # 🕒 展示该股票精准的抓取时刻（北京时间）
+    st.caption(f"🟢 数据解耦防护中 | **{ticker}** 数据抓取于 (北京时间): **{mkt['fetch_time']}** | 数据源: **{mkt['source']}**")
     
     # 全球宏观看板
     m1, m2, m3, m4 = st.columns(4)
