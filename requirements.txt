@@ -12,3 +12,6 @@ scipy
 plotly
 mplfinance
 matplotlib
+alpha_vantage
+pandas-datareader
+curl_cffi
