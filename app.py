@@ -106,21 +106,34 @@ PRESET_FLOATS = {
 }
 
 # ==========================================
-# 🚀 3. API 抓取引擎 & 深度期权分析
+# 🚀 3. 双源数据引擎 (主用 Yahoo / 备用 Stooq)
 # ==========================================
-def fetch_yahoo_chart_api(symbol):
+def fetch_macro_with_fallback(symbol, stooq_symbol):
+    """宏观数据双源兜底抓取"""
+    # 优先 Yahoo API
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
-        headers = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)'}
-        res = requests.get(url, headers=headers, timeout=3)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=2)
         if res.status_code == 200:
             meta = res.json()['chart']['result'][0]['meta']
             price = meta.get('regularMarketPrice', 0.0)
             prev = meta.get('chartPreviousClose', meta.get('previousClose', price))
-            pct = (price / prev - 1) if prev else 0.0
-            return price, pct
+            if price > 0:
+                return price, ((price / prev - 1) if prev else 0.0)
     except Exception:
         pass
+
+    # 备用 Stooq
+    try:
+        s_df = web.DataReader(stooq_symbol, 'stooq').head(2)
+        if not s_df.empty and len(s_df) >= 2:
+            p_last = s_df['Close'].iloc[0]
+            p_prev = s_df['Close'].iloc[1]
+            return p_last, (p_last / p_prev - 1)
+    except Exception:
+        pass
+
     return 0.0, 0.0
 
 @st.cache_data(ttl=300)
@@ -128,7 +141,9 @@ def get_enhanced_market_data(ticker_symbol):
     try:
         hist = pd.DataFrame()
         info = {}
+        data_source_used = "Yahoo Finance"
         
+        # --- 1. K 线主数据源：Yahoo ---
         try:
             tk = yf.Ticker(ticker_symbol)
             hist = tk.history(period="100d", interval="1d")
@@ -137,28 +152,33 @@ def get_enhanced_market_data(ticker_symbol):
         except Exception:
             hist = pd.DataFrame()
 
-        if hist.empty:
+        # --- 2. K 线备用数据源：Stooq (当 Yahoo 429 或返回空时自动触发) ---
+        if hist.empty or len(hist) < 5:
             try:
                 stooq_code = f"{ticker_symbol}.US" if "^" not in ticker_symbol and "." not in ticker_symbol else ticker_symbol
                 hist = web.DataReader(stooq_code, 'stooq').head(100)
                 hist = hist.sort_index()
+                if not hist.empty:
+                    data_source_used = "Stooq (备用源)"
             except Exception:
                 pass
 
         if hist.empty:
-            return "所有数据源访问均失败，请稍后再试。"
+            return "所有数据源（Yahoo与Stooq）均访问失败，请检查网络或稍后再试。"
 
-        btc, _ = fetch_yahoo_chart_api("BTC-USD")
-        nasdaq, nasdaq_pct = fetch_yahoo_chart_api("^IXIC")
-        vix, vix_pct = fetch_yahoo_chart_api("^VIX")
+        # --- 3. 宏观数据抓取（双源保活） ---
+        btc, _ = fetch_macro_with_fallback("BTC-USD", "BTCUSD")
+        nasdaq, nasdaq_pct = fetch_macro_with_fallback("^IXIC", "^NDQ")
+        vix, vix_pct = fetch_macro_with_fallback("^VIX", "^VIX")
 
-        # 获取可用到期日列表
+        # --- 4. 期权到期日抓取 ---
         exp_dates = []
-        try:
-            tk_opt = yf.Ticker(ticker_symbol)
-            exp_dates = list(tk_opt.options)
-        except Exception:
-            exp_dates = []
+        if data_source_used == "Yahoo Finance":
+            try:
+                tk_opt = yf.Ticker(ticker_symbol)
+                exp_dates = list(tk_opt.options)
+            except Exception:
+                exp_dates = []
 
         current_float = None
         if ticker_symbol in PRESET_FLOATS:
@@ -197,13 +217,14 @@ def get_enhanced_market_data(ticker_symbol):
         return hist, reg_params, dark, exp_dates, {
             'btc': btc, 'nasdaq': nasdaq, 'nasdaq_pct': nasdaq_pct, 
             'vix': vix, 'vix_pct': vix_pct, 'float': current_float, 
-            'volume': hist['Volume'].iloc[-1] if not hist.empty else 0
+            'volume': hist['Volume'].iloc[-1] if not hist.empty else 0,
+            'data_source': data_source_used
         }
     except Exception as e:
         return f"系统核心异常: {str(e)}"
 
 # -------------------------------------------------------------
-# 🎯 选定到期日的期权链及看涨墙/看跌墙/伽马翻转点计算
+# 期权链计算逻辑
 # -------------------------------------------------------------
 @st.cache_data(ttl=300)
 def get_option_chain_details(ticker_symbol, selected_exp, current_price):
@@ -216,38 +237,32 @@ def get_option_chain_details(ticker_symbol, selected_exp, current_price):
         calls = opt_data.calls
         puts = opt_data.puts
 
-        # 1. PCR 计算
         total_calls_oi = calls['openInterest'].sum() if not calls.empty else 0
         total_puts_oi = puts['openInterest'].sum() if not puts.empty else 0
         if total_calls_oi > 0:
             pcr_value = total_puts_oi / total_calls_oi
 
-        # 2. 看涨墙 (Call Wall) 与 看跌墙 (Put Wall)
         if not calls.empty and calls['openInterest'].max() > 0:
             call_wall = calls.loc[calls['openInterest'].idxmax()]['strike']
         if not puts.empty and puts['openInterest'].max() > 0:
             put_wall = puts.loc[puts['openInterest'].idxmax()]['strike']
 
-        # 3. 伽马翻转点 (Gamma Flip Point) 数值建模计算
         try:
             exp_date = datetime.strptime(selected_exp, '%Y-%m-%d')
             days = (exp_date - datetime.now()).days
             T = max(days, 1) / 365.0
             
-            # 建立标的资产价格扫描区间 (0.6 * Spot 至 1.4 * Spot)
             s_range = np.linspace(current_price * 0.6, current_price * 1.4, 150)
             net_gammas = []
 
             for s_test in s_range:
                 tot_g = 0.0
-                # Calls (Positive Gamma)
                 for _, row in calls.iterrows():
                     k, oi, iv = row['strike'], row['openInterest'], row.get('impliedVolatility', 0.2)
                     if oi > 0 and k > 0 and iv > 0.01:
                         d1 = (np.log(s_test / k) + 0.5 * (iv**2) * T) / (iv * np.sqrt(T))
                         gamma = np.exp(-0.5 * d1**2) / (s_test * iv * np.sqrt(2 * np.pi * T))
                         tot_g += oi * gamma
-                # Puts (Negative Gamma)
                 for _, row in puts.iterrows():
                     k, oi, iv = row['strike'], row['openInterest'], row.get('impliedVolatility', 0.2)
                     if oi > 0 and k > 0 and iv > 0.01:
@@ -256,7 +271,6 @@ def get_option_chain_details(ticker_symbol, selected_exp, current_price):
                         tot_g -= oi * gamma
                 net_gammas.append(tot_g)
 
-            # 寻找零点交叉位置 (Gamma Flip)
             net_gammas = np.array(net_gammas)
             zero_crossings = np.where(np.diff(np.sign(net_gammas)))[0]
             if len(zero_crossings) > 0:
@@ -265,14 +279,12 @@ def get_option_chain_details(ticker_symbol, selected_exp, current_price):
                 x1, x2 = s_range[idx], s_range[idx+1]
                 gamma_flip = x1 - y1 * (x2 - x1) / (y2 - y1) if (y2 - y1) != 0 else x1
             else:
-                # 兜底算法：OI 加权 strike
                 tot_oi = total_calls_oi + total_puts_oi
                 if tot_oi > 0:
                     gamma_flip = ((calls['strike']*calls['openInterest']).sum() + (puts['strike']*puts['openInterest']).sum()) / tot_oi
         except Exception:
             pass
 
-        # 4. ATM 中心化切片用于表格展示
         for df_type, target_df in [('calls', calls), ('puts', puts)]:
             if not target_df.empty:
                 idx = (target_df['strike'] - current_price).abs().idxmin()
@@ -323,6 +335,12 @@ if isinstance(data, str):
 elif data:
     hist_df, reg, dark_df, exp_dates, mkt = data
     last = hist_df.iloc[-1]
+    
+    # 🟢 明确提示当前正处于哪个数据源（让切换完全透明可见）
+    if "Stooq" in mkt['data_source']:
+        st.warning(f"🟡 注意：主数据源 (Yahoo) 响应异常，当前已自动降级并切换至 **{mkt['data_source']}**。(注：备用源仅支持价格/K线，不提供期权链数据)")
+    else:
+        st.caption(f"🟢 数据链路正常 | 当前主用数据源: **{mkt['data_source']}**")
     
     # 全球宏观看板
     m1, m2, m3, m4 = st.columns(4)
@@ -378,7 +396,7 @@ elif data:
     fig.update_xaxes(type='category', tickmode='linear', dtick=1, tickangle=-90)
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- 期权与大宗交易模块 ---
+    # 期权与大宗交易模块
     st.divider()
     o_col, d_col = st.columns([1.6, 1])
     
@@ -386,7 +404,6 @@ elif data:
         st.subheader("🕯️ 全景期权决策分析")
         
         if exp_dates:
-            # 默认勾选离今天最近的下一个期权到期日
             today_str = datetime.now().strftime('%Y-%m-%d')
             default_exp_idx = 0
             for idx, ed in enumerate(exp_dates):
@@ -395,11 +412,8 @@ elif data:
                     break
             
             selected_exp = st.selectbox("📅 选择期权到期日", options=exp_dates, index=default_exp_idx)
-            
-            # 获取指定到期日的期权指标
             calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_val = get_option_chain_details(ticker, selected_exp, last['Close'])
             
-            # 顶部 4 关键指标卡片展示
             q1, q2, q3, q4 = st.columns(4)
             q1.metric("🧱 看涨墙 (Call Wall)", f"${call_wall:.2f}" if pd.notnull(call_wall) else "N/A")
             q2.metric("🧱 看跌墙 (Put Wall)", f"${put_wall:.2f}" if pd.notnull(put_wall) else "N/A")
@@ -418,7 +432,7 @@ elif data:
                 else: 
                     st.info("该到期日暂无看跌期权数据或受到接口频控")
         else:
-            st.info("该股票暂无期权链数据")
+            st.info("💡 当前处于 Stooq 备用源模式（无期权链）或该股票暂无期权交易。")
             
     with d_col:
         st.subheader("🌑 大宗异动打印 (Dark Pool)")
