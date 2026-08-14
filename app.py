@@ -10,7 +10,6 @@ from datetime import datetime, timezone, timedelta
 import threading
 import requests
 import pandas_datareader.data as web
-from curl_cffi import requests as cffi_requests
 
 # ==========================================
 # 0. 页面全局配置与时区定义
@@ -19,15 +18,9 @@ st.set_page_config(layout="wide", page_title="专业量化决策终端")
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-PRESET_FLOATS = {
-    "BTDR": 123715025,
-    "AAPL": 15200000000,
-    "TSLA": 3180000000,
-    "NVDA": 24500000000,
-    "MSFT": 7430000000,
-    "GOOG": 12300000000,
-    "QQQ": 600000000
-}
+# 全局最小请求间隔(秒):所有打向 Yahoo 的请求(不管前台点击还是后台线程)共享同一个节流器,
+# 目的是"别去触发限流",而不是"触发了之后想办法绕过去"。
+GLOBAL_RATE_INTERVAL = 1.5
 
 # ==========================================
 # 🧠 1. 全局解耦内存存储中心
@@ -36,18 +29,41 @@ PRESET_FLOATS = {
 def get_global_data_store():
     return {
         "stock_cache": {},
-        "options_cache": {},        # key: f"{ticker}_{epoch}" -> option result dict
-        "expiration_cache": {},     # key: ticker -> {"list":[{date,epoch}...], "ts":...}
+        "options_cache": {},     # key: f"{ticker}_{expiration}" -> option result tuple
         "fetch_timestamps": {},
         "active_queue": set(["BTDR", "AAPL", "TSLA", "NVDA"]),
         "lock": threading.Lock(),
-        # --- Yahoo crumb/session 复用,避免每次请求都重新鉴权 ---
-        "yahoo_session": None,
-        "yahoo_crumb": None,
-        "crumb_expire_at": 0.0,
+        "last_yahoo_call_ts": 0.0,
     }
 
 GLOBAL_STORE = get_global_data_store()
+
+
+def _throttled_yahoo_call(func, max_retries=1):
+    """
+    所有对 Yahoo(不管是走 yfinance 库,还是直接 requests 打 Yahoo 的公开接口)的网络请求统一走这里:
+      - 全局节流:整个应用共享一个最小请求间隔,避免并发/高频触发限流。
+      - 遇到 429/Too Many Requests 就退避重试一次,超过重试次数就老实报错并提示稍后再试。
+      - 不做代理轮换、身份伪装、伪造 User-Agent 池等任何"绕过限制"的操作。
+    """
+    last_err = None
+    for attempt in range(max_retries + 1):
+        with GLOBAL_STORE["lock"]:
+            wait = GLOBAL_RATE_INTERVAL - (time.time() - GLOBAL_STORE["last_yahoo_call_ts"])
+            if wait > 0:
+                time.sleep(wait)
+            GLOBAL_STORE["last_yahoo_call_ts"] = time.time()
+        try:
+            return func()
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            if ("429" in msg or "Too Many Requests" in msg) and attempt < max_retries:
+                time.sleep(8 + attempt * 7)  # 老实退避,不做规避
+                continue
+            raise
+    raise last_err
+
 
 # ==========================================
 # 🔍 2. 动态加载全量美股库
@@ -72,12 +88,48 @@ def load_us_stock_library():
 STOCK_LIBRARY = load_us_stock_library()
 
 # ==========================================
-# 🚀 3. 抗崩溃行情数据抓取引擎(个股 K 线 / 宏观指数)
+# 📐 3. 股本数据(换手率分母)
+# ==========================================
+@st.cache_data(ttl=86400)
+def get_share_stats(ticker_symbol):
+    """
+    换手率分母修复:
+      - 不再用硬编码字典(会随增发/回购/拆股过时)。
+      - 优先用"流通股 floatShares",拿不到才退回"总股本 sharesOutstanding"。
+      - 明确返回用的是哪种口径,UI上标注出来,避免两种不同含义的数字被当成同一件事看。
+      - 每天刷新一次,不绑死在行情缓存的生命周期里。
+    """
+    try:
+        info = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).info)
+    except Exception:
+        info = {}
+
+    float_shares = info.get('floatShares')
+    shares_out = info.get('sharesOutstanding')
+
+    if float_shares and float_shares > 0:
+        return float_shares, "流通股(Float)"
+    if shares_out and shares_out > 0:
+        return shares_out, "总股本(Outstanding·近似)"
+    return None, "无股本数据"
+
+
+def get_effective_float(ticker_symbol):
+    """支持侧边栏手动修正:如果你对某个标的的股本有更准的数据源,可以自己填,不用改代码。"""
+    override_key = f"float_override_{ticker_symbol}"
+    override_val = st.session_state.get(override_key)
+    if override_val and override_val > 0:
+        return float(override_val), "手动修正"
+    return get_share_stats(ticker_symbol)
+
+
+# ==========================================
+# 🚀 4. 抗崩溃行情数据抓取引擎(个股 K 线 / 宏观指数)
 # ==========================================
 def fetch_macro_api(symbol, stooq_symbol):
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        res = _throttled_yahoo_call(lambda: requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3))
         if res.status_code == 200:
             meta = res.json()['chart']['result'][0]['meta']
             price = meta.get('regularMarketPrice', 0.0)
@@ -96,22 +148,28 @@ def fetch_macro_api(symbol, stooq_symbol):
     return 0.0, 0.0
 
 
+def get_live_quote(ticker_symbol):
+    """实时(尽力而为)现价与成交量,来自 yfinance 的 fast_info,比日线K线更贴近当前时刻。"""
+    try:
+        tk = yf.Ticker(ticker_symbol)
+        fi = _throttled_yahoo_call(lambda: tk.fast_info)
+        price = fi.get('last_price') or fi.get('lastPrice')
+        volume = fi.get('last_volume') or fi.get('lastVolume') or fi.get('regular_market_volume')
+        return price, volume
+    except Exception:
+        return None, None
+
+
 def do_fetch_stock_data(ticker_symbol):
     try:
         now_ts = time.time()
         fetch_time_bj = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
         hist = pd.DataFrame()
-        info = {}
         source = "Yahoo Finance"
 
         try:
-            tk = yf.Ticker(ticker_symbol)
-            hist = tk.history(period="100d", interval="1d")
-            try:
-                info = tk.info
-            except Exception:
-                info = {}
+            hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"))
         except Exception:
             hist = pd.DataFrame()
 
@@ -131,7 +189,7 @@ def do_fetch_stock_data(ticker_symbol):
         nasdaq, nasdaq_pct = fetch_macro_api("^IXIC", "^NDQ")
         vix, vix_pct = fetch_macro_api("^VIX", "^VIX")
 
-        current_float = PRESET_FLOATS.get(ticker_symbol, info.get('floatShares') or info.get('sharesOutstanding'))
+        current_float, float_label = get_effective_float(ticker_symbol)
 
         hist.index = pd.to_datetime(hist.index).date
         hist['昨收'] = hist['Close'].shift(1)
@@ -157,10 +215,14 @@ def do_fetch_stock_data(ticker_symbol):
             m = LinearRegression().fit(X, fit_df[target].values / fit_df['昨收'].values - 1)
             reg_params[f's_{tag}'], reg_params[f'i_{tag}'] = m.coef_[0], m.intercept_
 
+        live_price, live_volume = get_live_quote(ticker_symbol)
+        volume_for_turnover = live_volume if (live_volume and live_volume > 0) else hist['Volume'].iloc[-1]
+
         return hist, reg_params, dark, {
             'btc': btc, 'nasdaq': nasdaq, 'nasdaq_pct': nasdaq_pct,
-            'vix': vix, 'vix_pct': vix_pct, 'float': current_float,
-            'volume': hist['Volume'].iloc[-1], 'source': source,
+            'vix': vix, 'vix_pct': vix_pct,
+            'float': current_float, 'float_label': float_label,
+            'volume': volume_for_turnover, 'source': source,
             'fetch_time': fetch_time_bj,
             'timestamp': now_ts
         }
@@ -169,109 +231,27 @@ def do_fetch_stock_data(ticker_symbol):
 
 
 # ==========================================
-# 🎯 4. Yahoo 期权链客户端(重构核心:统一鉴权 + 到期日以接口原始时间戳为准)
+# 🎯 5. 期权链(改用 yfinance 自带方法,不再手动拼 crumb/时间戳)
 # ==========================================
-class YahooOptionsError(Exception):
-    """期权接口的显式错误,替代原来的静默 except: pass"""
-    pass
-
-
-def _build_new_yahoo_session():
-    session = cffi_requests.Session(impersonate="chrome110")
-    session.headers.update({"User-Agent": "Mozilla/5.0"})
-    return session
-
-
-def _refresh_yahoo_crumb(store):
-    """重新建立会话并领取新 crumb,成功后写回全局缓存(约45分钟有效期内复用)。"""
-    session = _build_new_yahoo_session()
-    session.get("https://fc.yahoo.com", timeout=6)  # 拿反爬 cookie
-    resp = session.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=6)
-    crumb = (resp.text or "").strip()
-    # crumb 正常应该是一小段无空白短字符串,如果拿到的是网页/错误信息就说明鉴权失败
-    if not crumb or len(crumb) > 40 or "<" in crumb:
-        raise YahooOptionsError(f"获取 Yahoo 鉴权 crumb 失败(可能被反爬拦截): {crumb[:60]!r}")
-    with store["lock"]:
-        store["yahoo_session"] = session
-        store["yahoo_crumb"] = crumb
-        store["crumb_expire_at"] = time.time() + 45 * 60
-    return session, crumb
-
-
-def _get_valid_yahoo_crumb(store, force_refresh=False):
-    with store["lock"]:
-        session = store.get("yahoo_session")
-        crumb = store.get("yahoo_crumb")
-        expired = time.time() > store.get("crumb_expire_at", 0)
-    if force_refresh or not session or not crumb or expired:
-        return _refresh_yahoo_crumb(store)
-    return session, crumb
-
-
-def _request_yahoo_option_chain(ticker_symbol, store, date_epoch=None):
-    """
-    请求 Yahoo 期权链原始接口。
-    date_epoch=None 时,Yahoo 会返回“最近一个到期日”的数据,并附带 expirationDates 全量列表——
-    这正是我们用来构造到期日下拉框、且保证后续请求“日期→时间戳”100%对应的唯一权威来源。
-    """
-    session, crumb = _get_valid_yahoo_crumb(store)
-    url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker_symbol}"
-    params = {"crumb": crumb}
-    if date_epoch is not None:
-        params["date"] = int(date_epoch)
-
-    resp = session.get(url, params=params, timeout=8)
-
-    # crumb 失效(401/403)时强制刷新一次再重试,而不是直接判定"无数据"
-    if resp.status_code in (401, 403):
-        session, crumb = _get_valid_yahoo_crumb(store, force_refresh=True)
-        params["crumb"] = crumb
-        resp = session.get(url, params=params, timeout=8)
-
-    if resp.status_code != 200:
-        raise YahooOptionsError(f"Yahoo 期权接口返回状态码 {resp.status_code},当前标的或该时段可能被限流")
-
-    try:
-        payload = resp.json()
-    except Exception:
-        raise YahooOptionsError("Yahoo 期权接口返回了非 JSON 内容(通常是被反爬拦截,而不是真的没数据)")
-
-    chain = payload.get("optionChain", {})
-    if chain.get("error"):
-        raise YahooOptionsError(f"Yahoo 接口报错: {chain['error']}")
-
-    results = chain.get("result") or []
-    if not results:
-        raise YahooOptionsError("该标的没有可用的期权链数据(可能本身不支持期权交易)")
-
-    return results[0]
-
-
-@st.cache_data(ttl=600)  # 到期日列表10分钟内基本不变,减少对 Yahoo 的请求频次
 def get_expiration_list(ticker_symbol):
     """
-    关键修复点:到期日列表直接来自 Yahoo 接口自带的 expirationDates 数组(epoch 时间戳),
-    不再用 yfinance 的另一套会话去猜日期,也不再用 datetime.strptime 自己拼时间戳。
-    下拉框展示的每个日期都和它对应的真实 epoch 一一绑定,选中后直接把 epoch 传回去请求,
-    彻底消除"选的到期日 A,实际拿到到期日 B 的数据"这个不准的根源。
+    到期日直接用 yfinance 的 tk.options,库内部已经处理好了和 Yahoo 的认证与日期映射,
+    不需要我们自己算时间戳——这正是之前"选的到期日A、实际拿到B"这个bug的根源,现在直接消失。
     """
-    result = _request_yahoo_option_chain(ticker_symbol, GLOBAL_STORE, date_epoch=None)
-    epochs = result.get("expirationDates") or []
-    exp_list = [
-        {"date": datetime.fromtimestamp(int(e), tz=timezone.utc).strftime('%Y-%m-%d'), "epoch": int(e)}
-        for e in epochs
-    ]
-    return exp_list
+    tk = yf.Ticker(ticker_symbol)
+    dates = _throttled_yahoo_call(lambda: list(tk.options))
+    return dates
 
 
-def do_fetch_option_details(ticker_symbol, target_epoch, fallback_current_price):
+def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_price):
     """
     三级智能降级模型(保留原有设计):OI 优先 -> 成交量 -> 行权价分布权重。
     重构点:
-      1. date 参数直接用调用方传入的、来自 get_expiration_list 的真实 epoch,不再重新计算。
-      2. 现价优先用本次期权接口自带的实时报价(quote.regularMarketPrice),比日线收盘价更准。
-      3. IV 缺失/异常的行权价从 Gamma Flip 的数值积分里剔除,不再用固定 25% 顶替(避免虚构数据)。
-      4. 明确的异常状态返回,UI 层可以区分"接口失败"和"这个到期日确实没有报价"。
+      1. 期权原始数据来自 yfinance 的 tk.option_chain(date),不再手写反爬请求。
+      2. 所有网络请求走全局节流器,失败(429)老实退避重试一次,不做任何绕过限制的操作。
+      3. 现价优先用 fast_info 的实时价,而不是可能滞后的日线收盘价。
+      4. IV 缺失/异常的行权价从 Gamma Flip 的数值积分里剔除,不再用固定值顶替(避免虚构数据)。
+      5. 明确的异常状态返回,区分"接口失败/被限流"和"这个到期日确实没有报价"。
     """
     calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
     call_wall, put_wall, gamma_flip, pcr_value = np.nan, np.nan, np.nan, np.nan
@@ -279,21 +259,17 @@ def do_fetch_option_details(ticker_symbol, target_epoch, fallback_current_price)
     status_msg = None
 
     try:
-        result = _request_yahoo_option_chain(ticker_symbol, GLOBAL_STORE, date_epoch=target_epoch)
-
-        # 用接口自带的实时报价覆盖“过时的日线收盘价”,提升墙位/Gamma翻转点的定位精度
-        quote = result.get("quote") or {}
-        live_price = quote.get("regularMarketPrice")
-        current_price = live_price if (isinstance(live_price, (int, float)) and live_price > 0) else fallback_current_price
-        if pd.isna(current_price) or current_price <= 0:
-            current_price = 10.0
-
-        options_block = (result.get("options") or [{}])[0]
-        calls = pd.DataFrame(options_block.get("calls", []))
-        puts = pd.DataFrame(options_block.get("puts", []))
+        tk = yf.Ticker(ticker_symbol)
+        opt = _throttled_yahoo_call(lambda: tk.option_chain(expiration_date), max_retries=1)
+        calls, puts = opt.calls.copy(), opt.puts.copy()
 
         if calls.empty and puts.empty:
-            status_msg = "该到期日 Yahoo 未返回任何期权报价(可能是刚上市/深度虚值月份流动性太低)"
+            status_msg = "该到期日 Yahoo 未返回任何期权报价(可能流动性太低)"
+
+        live_price, _ = get_live_quote(ticker_symbol)
+        current_price = live_price if (isinstance(live_price, (int, float)) and live_price and live_price > 0) else fallback_current_price
+        if pd.isna(current_price) or current_price <= 0:
+            current_price = 10.0
 
         for df in (calls, puts):
             if not df.empty:
@@ -302,11 +278,9 @@ def do_fetch_option_details(ticker_symbol, target_epoch, fallback_current_price)
                         df[col] = 0.0
                     else:
                         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
-                # 有效 IV 掩码:严格剔除缺失/异常值,不再拿 25% 顶替去参与 Gamma 计算
-                df['iv_valid'] = df['impliedVolatility'] > 0.01
+                df['iv_valid'] = df['impliedVolatility'] > 0.01  # 无效IV直接从Gamma计算里剔除,不用固定值顶替
                 df['density_weight'] = 1.0 / (1.0 + (df['strike'] - current_price).abs())
 
-        # 行权价合理区间过滤(保留原逻辑)
         if not calls.empty:
             calls = calls[(calls['strike'] >= current_price * 0.2) & (calls['strike'] <= current_price * 3.0)].copy()
         if not puts.empty:
@@ -330,13 +304,10 @@ def do_fetch_option_details(ticker_symbol, target_epoch, fallback_current_price)
             calc_mode = "行权价分布"
             pcr_value = 1.0
 
-        # 1. 看涨墙(压力位)
         if not calls.empty:
             c_above = calls[calls['strike'] >= current_price]
             c_target = c_above if not c_above.empty else calls
             call_wall = float(c_target.loc[c_target[w_col].idxmax(), 'strike'])
-
-        # 2. 看跌墙(支撑位)
         if not puts.empty:
             p_below = puts[puts['strike'] <= current_price]
             p_target = p_below if not p_below.empty else puts
@@ -347,9 +318,8 @@ def do_fetch_option_details(ticker_symbol, target_epoch, fallback_current_price)
         if pd.isna(put_wall) and not puts.empty:
             put_wall = float(puts['strike'].min())
 
-        # 3. Gamma Flip:只用 IV 有效的行权价参与积分,避免用虚构 IV 污染结果
         try:
-            exp_date_dt = datetime.fromtimestamp(target_epoch, tz=timezone.utc)
+            exp_date_dt = datetime.strptime(expiration_date, '%Y-%m-%d').replace(tzinfo=timezone.utc)
             T = max((exp_date_dt - datetime.now(timezone.utc)).days, 1) / 365.0
             s_range = np.linspace(current_price * 0.7, current_price * 1.3, 80)
             net_gammas = []
@@ -382,7 +352,6 @@ def do_fetch_option_details(ticker_symbol, target_epoch, fallback_current_price)
         except Exception:
             gamma_flip = float(current_price)
 
-        # 表格切片(展示层保留原始 IV,哪怕是0也如实显示,不做美化)
         for df_type, target_df in [('calls', calls), ('puts', puts)]:
             if not target_df.empty:
                 idx = (target_df['strike'] - current_price).abs().idxmin()
@@ -392,18 +361,19 @@ def do_fetch_option_details(ticker_symbol, target_epoch, fallback_current_price)
                 else:
                     puts_df = slice_df
 
-    except YahooOptionsError as e:
-        status_msg = str(e)
-        calc_mode = "接口异常"
     except Exception as e:
-        status_msg = f"未预期的异常: {e}"
+        msg = str(e)
+        if "429" in msg or "Too Many Requests" in msg:
+            status_msg = "触发 Yahoo 限流(429),请等几分钟再试,或降低刷新频率(不建议强行重试)"
+        else:
+            status_msg = f"期权数据获取失败: {msg}"
         calc_mode = "接口异常"
 
     return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_value, calc_mode, status_msg
 
 
 # ==========================================
-# 🔄 5. 永不崩溃的后台守护线程
+# 🔄 6. 永不崩溃的后台守护线程
 # ==========================================
 def background_updater_loop():
     while True:
@@ -427,13 +397,12 @@ def background_updater_loop():
                         except Exception:
                             exp_list = []
 
-                        for exp_item in exp_list[:2]:  # 预热最近两个到期日
+                        for exp_date in exp_list[:2]:  # 只预热最近两个到期日,减少总请求量
                             try:
-                                opt_key = f"{ticker}_{exp_item['epoch']}"
-                                opt_data = do_fetch_option_details(ticker, exp_item['epoch'], last_price)
+                                opt_key = f"{ticker}_{exp_date}"
+                                opt_data = do_fetch_option_details(ticker, exp_date, last_price)
                                 with GLOBAL_STORE["lock"]:
                                     GLOBAL_STORE["options_cache"][opt_key] = opt_data
-                                time.sleep(1.0)
                             except Exception:
                                 pass
 
@@ -455,7 +424,7 @@ def start_background_engine():
 start_background_engine()
 
 # ==========================================
-# 🖥️ 6. 纯前端 UI 渲染层
+# 🖥️ 7. 纯前端 UI 渲染层
 # ==========================================
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; } </style>""", unsafe_allow_html=True)
 
@@ -483,6 +452,18 @@ with st.sidebar:
             GLOBAL_STORE["active_queue"].add(new_tk)
         st.rerun()
 
+    st.divider()
+    st.caption("💡 换手率分母的手动修正(留空/填0则自动获取)")
+    manual_float = st.number_input(
+        f"{st.session_state.current_ticker} 流通股手动修正",
+        min_value=0, value=0, step=1000000,
+        help="如果你对这个标的的流通股数量有更准确的数据源,可以在这里手动填入,留 0 则走自动获取。"
+    )
+    override_key = f"float_override_{st.session_state.current_ticker}"
+    st.session_state[override_key] = manual_float if manual_float > 0 else None
+
+    st.caption(f"📡 期权数据源: Yahoo Finance(经 yfinance) | 全局节流间隔: {GLOBAL_RATE_INTERVAL}s")
+
 ticker = st.session_state.current_ticker
 st.title(f"🎯 {ticker} 专业量化决策终端")
 
@@ -502,12 +483,12 @@ if not stock_data or is_expired:
                 GLOBAL_STORE["active_queue"].add(ticker)
 
 if not stock_data:
-    st.error("⚠️ 当前股票数据拉取失败,可能是股票代码不匹配或数据源暂时中断。")
+    st.error("⚠️ 当前股票数据拉取失败,可能是股票代码不匹配、数据源暂时中断,或被限流(稍后再试)。")
 else:
     hist_df, reg, dark_df, mkt = stock_data
     last = hist_df.iloc[-1]
 
-    st.caption(f"🟢 数据解耦防护中 | **{ticker}** 数据抓取于 (北京时间): **{mkt['fetch_time']}** | 数据源: **{mkt['source']}**")
+    st.caption(f"🟢 数据解耦防护中 | **{ticker}** 数据抓取于 (北京时间): **{mkt['fetch_time']}** | 行情源: **{mkt['source']}**")
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Bitcoin", f"${mkt['btc']:,.0f}" if mkt['btc'] > 0 else "N/A")
@@ -522,7 +503,8 @@ else:
         st.subheader("📊 实时指标")
         if mkt['float'] and mkt['float'] > 0:
             turnover_rate = (mkt['volume'] / mkt['float']) * 100
-            st.write(f"实时换手: **{turnover_rate:.2f}%**")
+            st.write(f"实时换手 ({mkt['float_label']}): **{turnover_rate:.2f}%**")
+            st.caption(f"分母股本: {mkt['float']:,.0f} 股 | 分子成交量: {mkt['volume']:,.0f} 股")
         else:
             st.write("实时换手: **N/A (无股本数据)**")
         st.write(f"BOLL 高/低: **{last['Upper']:.2f} / {last['Lower']:.2f}**")
@@ -568,31 +550,28 @@ else:
 
         try:
             exp_list = get_expiration_list(ticker)
-        except YahooOptionsError as e:
-            exp_list = []
-            st.warning(f"⚠️ 到期日列表获取失败: {e}")
         except Exception as e:
             exp_list = []
-            st.warning(f"⚠️ 到期日列表获取异常: {e}")
+            msg = str(e)
+            if "429" in msg or "Too Many Requests" in msg:
+                st.warning("⚠️ 到期日列表获取被限流(429),请等几分钟再试。")
+            else:
+                st.warning(f"⚠️ 到期日列表获取异常: {e}")
 
         if exp_list:
-            date_to_epoch = {item['date']: item['epoch'] for item in exp_list}
-            date_options = list(date_to_epoch.keys())
-
-            today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            today_str = datetime.now().strftime('%Y-%m-%d')
             default_exp_idx = 0
-            for idx, d in enumerate(date_options):
+            for idx, d in enumerate(exp_list):
                 if d > today_str:
                     default_exp_idx = idx
                     break
 
-            selected_exp = st.selectbox("📅 选择期权到期日", options=date_options, index=default_exp_idx)
-            selected_epoch = date_to_epoch[selected_exp]  # 关键:直接用接口原始 epoch,不做二次转换
+            selected_exp = st.selectbox("📅 选择期权到期日", options=exp_list, index=default_exp_idx)
 
-            opt_key = f"{ticker}_{selected_epoch}"
+            opt_key = f"{ticker}_{selected_exp}"
             opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
             if not opt_data or is_expired:
-                opt_data = do_fetch_option_details(ticker, selected_epoch, last['Close'])
+                opt_data = do_fetch_option_details(ticker, selected_exp, last['Close'])
                 if opt_data:
                     with GLOBAL_STORE["lock"]:
                         GLOBAL_STORE["options_cache"][opt_key] = opt_data
@@ -603,7 +582,7 @@ else:
                 if status_msg:
                     st.info(f"ℹ️ {status_msg}")
 
-                st.caption(f"ℹ️ 权重维度说明:当前建模基于 **{calc_mode}** 动态推算 | 到期日 (UTC): **{selected_exp}**")
+                st.caption(f"ℹ️ 权重维度: **{calc_mode}** | 到期日: **{selected_exp}**")
 
                 q1, q2, q3, q4 = st.columns(4)
                 q1.metric("🧱 看涨墙 (Call Wall)", f"${call_wall:.2f}" if pd.notnull(call_wall) else "N/A")
@@ -627,7 +606,7 @@ else:
                     else:
                         st.info("该到期日暂无看跌期权数据")
         else:
-            st.info("💡 当前标的暂无期权链交易,或接口暂时不可用。")
+            st.info("💡 当前标的暂无期权链交易,或接口暂时不可用/被限流。")
 
     with d_col:
         st.subheader("🌑 大宗异动打印 (Dark Pool)")
