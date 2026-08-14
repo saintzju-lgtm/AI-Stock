@@ -142,18 +142,15 @@ def do_fetch_stock_data(ticker_symbol):
         dark = hist[hist['Volume'] > avg_vol * 1.2].tail(8).copy()
         dark['Signal'] = dark.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
 
-        # -------------------------------------------------------------
-        # 🎯 优化项 A & B：波动率自适应 + 残差分位数拟合引擎
-        # -------------------------------------------------------------
+        # 波动率自适应 + 残差分位数拟合引擎
         fit_df = hist.dropna().copy()
         X = ((fit_df['Open'] - fit_df['昨收']) / fit_df['昨收']).values.reshape(-1, 1)
         reg_params = {}
 
-        # 1. 波动率缩放因子 (当前20日波动率 vs 全局平均波动率)
         recent_vol = fit_df['Close'].pct_change().tail(20).std()
         hist_vol = fit_df['Close'].pct_change().std()
         vol_scale = (recent_vol / hist_vol) if (hist_vol > 0 and pd.notnull(recent_vol)) else 1.0
-        vol_scale = float(np.clip(vol_scale, 0.6, 1.8)) # 边界限制，防止极端异常值
+        vol_scale = float(np.clip(vol_scale, 0.6, 1.8))
 
         for tag, target in [('h', 'High'), ('l', 'Low')]:
             y_real = fit_df[target].values / fit_df['昨收'].values - 1
@@ -161,7 +158,6 @@ def do_fetch_stock_data(ticker_symbol):
             y_pred = m.predict(X)
             residuals = y_real - y_pred
             
-            # 计算残差的 10%、50%、90% 分位数
             q10, q50, q90 = np.percentile(residuals, [10, 50, 90])
             
             reg_params[f's_{tag}'] = float(m.coef_[0])
@@ -224,18 +220,13 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
                 df['impliedVolatility'] = df['impliedVolatility'].apply(lambda x: x if x > 0.01 else 0.25)
                 df['density_weight'] = 1.0 / (1.0 + (df['strike'] - current_price).abs())
 
-        # -------------------------------------------------------------
-        # 🎯 优化项 C：期权 ATM IV & Expected Move (预期波幅) 计算
-        # -------------------------------------------------------------
+        # ATM IV & Expected Move 计算
         all_options = pd.concat([calls, puts], ignore_index=True)
         if not all_options.empty:
             atm_row = all_options.iloc[(all_options['strike'] - current_price).abs().idxmin()]
             atm_iv = float(atm_row['impliedVolatility'])
             if atm_iv > 0:
-                # 单日预期波动额: Price * IV * sqrt(1/365)
                 move_1d = current_price * atm_iv * np.sqrt(1.0 / 365.0)
-                
-                # 到期日预期波动额: Price * IV * sqrt(Days/365)
                 exp_date = datetime.strptime(selected_exp, '%Y-%m-%d')
                 days_to_exp = max((exp_date - datetime.now()).days, 1)
                 move_exp = current_price * atm_iv * np.sqrt(days_to_exp / 365.0)
@@ -324,7 +315,8 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
     except Exception:
         calc_mode = "行权价分布"
 
-    return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_val, calc_mode, atm_iv, move_1d, move_exp
+    # 🛠️ 修复点：将 pcr_val 修正为 pcr_value，解决 NameError
+    return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_value, calc_mode, atm_iv, move_1d, move_exp
 
 # ==========================================
 # 🔄 4. 永不崩溃的后台守护线程
@@ -350,7 +342,7 @@ def background_updater_loop():
                         
                         for exp_date in future_exps:
                             try:
-                                opt_key = f"v4_{ticker}_{exp_date}" # 👈 升级至 v4_ 缓存键
+                                opt_key = f"v4_{ticker}_{exp_date}"
                                 opt_data = do_fetch_option_details(ticker, exp_date, last_price)
                                 with GLOBAL_STORE["lock"]:
                                     GLOBAL_STORE["options_cache"][opt_key] = opt_data
@@ -435,9 +427,7 @@ else:
 
     st.divider()
     
-    # -------------------------------------------------------------
-    # 🎯 场景回归预测 (整合 A:波动率自适应 + B:分位数残差)
-    # -------------------------------------------------------------
+    # 场景回归预测 (整合 A:波动率自适应 + B:分位数残差)
     c1, c2 = st.columns([1, 1.5])
     with c1:
         st.subheader("📊 实时指标")
@@ -455,11 +445,9 @@ else:
         ratio_o = (last['Open'] - last['昨收']) / last['昨收'] if last['昨收'] > 0 else 0
         v_scale = reg.get('vol_scale', 1.0)
         
-        # 拟合基准点
         pred_h_base = reg['i_h'] + reg['s_h'] * ratio_o
         pred_l_base = reg['i_l'] + reg['s_l'] * ratio_o
         
-        # 乐观 (90%残差分位) / 中性 (50%残差分位) / 悲观 (10%残差分位)
         p_h_90 = last['昨收'] * (1 + pred_h_base + reg['q90_h'] * v_scale)
         p_h_50 = last['昨收'] * (1 + pred_h_base + reg['q50_h'] * v_scale)
         p_h_10 = last['昨收'] * (1 + pred_h_base + reg['q10_h'] * v_scale)
@@ -525,9 +513,6 @@ else:
             if opt_data:
                 calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_val, calc_mode, atm_iv, move_1d, move_exp = opt_data
                 
-                # -------------------------------------------------------------
-                # 🎯 优化项 C：展现期权 IV Expected Move 校验卡片
-                # -------------------------------------------------------------
                 st.caption(f"ℹ️ 权重大维：基于 **{calc_mode}** 建模 | 平值隐含波动率 (ATM IV): **{atm_iv:.2%}**" if pd.notnull(atm_iv) else f"ℹ️ 权重大维：基于 **{calc_mode}** 建模")
 
                 q1, q2, q3, q4 = st.columns(4)
@@ -536,7 +521,6 @@ else:
                 q3.metric("🌀 伽马翻转点", f"${gamma_flip:.2f}" if pd.notnull(gamma_flip) else "N/A")
                 q4.metric("📊 Put/Call Ratio", f"{pcr_val:.2f}" if pd.notnull(pcr_val) else "N/A")
 
-                # 期权 Expected Move 对齐显示
                 if pd.notnull(move_1d) and pd.notnull(move_exp):
                     em1, em2 = st.columns(2)
                     em1.info(f"🎯 **期权市场单日期望波幅 (1D Expected Move)**: ±${move_1d:.2f} (区间: **${last['Close']-move_1d:.2f} ~ ${last['Close']+move_1d:.2f}**) ")
