@@ -96,8 +96,19 @@ def load_us_stock_library():
 
 STOCK_LIBRARY = load_us_stock_library()
 
+# 常用股票真实股本硬编码兜底表 (防止 API 彻底封锁时换手率错乱)
+PRESET_FLOATS = {
+    "BTDR": 123715025,
+    "AAPL": 15200000000,
+    "TSLA": 3180000000,
+    "NVDA": 24500000000,
+    "MSFT": 7430000000,
+    "GOOG": 12300000000,
+    "QQQ": 600000000
+}
+
 # ==========================================
-# ⚙️ 3. 核心量化引擎 (双源智能切换 + 防封锁)
+# ⚙️ 3. 核心量化引擎 (精准股本换手率 + 防封锁)
 # ==========================================
 @st.cache_data(ttl=300)
 def get_enhanced_market_data(ticker_symbol):
@@ -115,7 +126,7 @@ def get_enhanced_market_data(ticker_symbol):
         except Exception:
             hist = pd.DataFrame()
 
-        # --- 抓取尝试 2: 兜底数据源 Stooq (对云端 IP 极友好) ---
+        # --- 抓取尝试 2: 兜底数据源 Stooq ---
         if hist.empty:
             try:
                 stooq_code = f"{ticker_symbol}.US" if "^" not in ticker_symbol and "." not in ticker_symbol else ticker_symbol
@@ -143,7 +154,7 @@ def get_enhanced_market_data(ticker_symbol):
         nasdaq, nasdaq_pct = safe_get_macro("^IXIC")
         vix, vix_pct = safe_get_macro("^VIX")
 
-        # 期权数据抓取 (若被封自动容错置空)
+        # 期权数据抓取
         calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
         current_exp, pcr_value = "N/A", "N/A"
         try:
@@ -172,12 +183,12 @@ def get_enhanced_market_data(ticker_symbol):
         except Exception:
             pass
 
-        # 流通股矫正
-        if ticker_symbol in ["BTDR", "比特小鹿"]:
-            current_float = 123715025
-        else:
-            current_float = info.get('floatShares') if info else 100000000
-            if not current_float: current_float = 100000000
+        # --- 精准股本获取逻辑 ---
+        current_float = None
+        if ticker_symbol in PRESET_FLOATS:
+            current_float = PRESET_FLOATS[ticker_symbol]
+        elif info:
+            current_float = info.get('floatShares') or info.get('sharesOutstanding')
 
         # 数据清洗与指标计算
         hist.index = pd.to_datetime(hist.index).date
@@ -186,7 +197,12 @@ def get_enhanced_market_data(ticker_symbol):
         hist['MA20'] = hist['Close'].rolling(20).mean()
         std20 = hist['Close'].rolling(20).std()
         hist['Upper'], hist['Lower'] = hist['MA20'] + std20*2, hist['MA20'] - std20*2
-        hist['换手率_raw'] = (hist['Volume'] / current_float)
+        
+        # 换手率计算 (严格校验股本有效性)
+        if current_float and current_float > 0:
+            hist['换手率_raw'] = (hist['Volume'] / current_float)
+        else:
+            hist['换手率_raw'] = np.nan
         
         # MFI 资金流
         tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
@@ -268,8 +284,11 @@ elif data:
     c1, c2 = st.columns([1, 1.5])
     with c1:
         st.subheader("📊 实时指标")
-        turnover_rate = (mkt['volume']/mkt['float'])*100 if mkt['float'] > 0 else 0
-        st.write(f"实时换手: **{turnover_rate:.2f}%**")
+        if mkt['float'] and mkt['float'] > 0:
+            turnover_rate = (mkt['volume']/mkt['float'])*100
+            st.write(f"实时换手: **{turnover_rate:.2f}%**")
+        else:
+            st.write("实时换手: **N/A (无股本数据)**")
         st.write(f"BOLL 高/低: **{last['Upper']:.2f} / {last['Lower']:.2f}**")
         st.write(f"资金 MFI: **{last['MFI']:.2f}**")
     with c2:
@@ -287,8 +306,6 @@ elif data:
     st.divider()
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
     p_df = hist_df.tail(40).copy()
-    
-    # 【已修复】针对 Index 类型正确的 strftime 转换格式
     p_df['label'] = pd.to_datetime(p_df.index).strftime('%m-%d')
     
     fig.add_trace(go.Scatter(x=p_df['label'], y=p_df['Upper'], line=dict(color='rgba(0,102,204,0.3)'), name=f"High:{last['Upper']:.2f}"), row=1, col=1)
@@ -297,7 +314,12 @@ elif data:
     fig.add_trace(go.Scatter(x=p_df['label'], y=p_df['MA5'], line=dict(color='#FF9800'), name=f"MA5:{last['MA5']:.2f}"), row=1, col=1)
     
     colors = ['#E53935' if (p_df['Close'].iloc[i] >= p_df['Open'].iloc[i]) else '#43A047' for i in range(len(p_df))]
-    fig.add_trace(go.Bar(x=p_df['label'], y=p_df['换手率_raw']*100, marker_color=colors, name="换手%"), row=2, col=1)
+    
+    # 柱状图：有换手率显示换手率，无则回退显示成交量(万股)
+    if p_df['换手率_raw'].notnull().any():
+        fig.add_trace(go.Bar(x=p_df['label'], y=p_df['换手率_raw']*100, marker_color=colors, name="换手%"), row=2, col=1)
+    else:
+        fig.add_trace(go.Bar(x=p_df['label'], y=p_df['Volume']/10000, marker_color=colors, name="成交量(万股)"), row=2, col=1)
     
     fig.update_layout(height=500, xaxis_rangeslider_visible=False, template="plotly_white", dragmode=False)
     fig.update_xaxes(type='category', tickmode='linear', dtick=1, tickangle=-90)
@@ -332,7 +354,10 @@ elif data:
     # 历史数据表
     st.subheader("📋 历史明细")
     hist_show = hist_df.tail(15).copy()
-    hist_show['换手'] = (hist_show['换手率_raw'] * 100).map('{:.2f}%'.format)
+    if hist_show['换手率_raw'].notnull().any():
+        hist_show['换手'] = (hist_show['换手率_raw'] * 100).map('{:.2f}%'.format)
+    else:
+        hist_show['换手'] = "N/A"
     st.dataframe(hist_show[['Open','High','Low','Close','换手','MFI','MA20','MA5']].style.format(precision=2), use_container_width=True)
 
     if auto_refresh:
