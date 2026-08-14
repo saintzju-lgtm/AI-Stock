@@ -10,7 +10,6 @@ from datetime import datetime
 import threading
 import requests
 import pandas_datareader.data as web
-from curl_cffi import requests as cffi_requests
 
 # ==========================================
 # 0. 页面全局配置 (必须放在第一行)
@@ -83,7 +82,7 @@ def load_us_stock_library():
     ]
     
     try:
-        headers = {'User-Agent': 'Quant-Terminal-App/1.0 (admin@example.com)'}
+        headers = {'User-Agent': 'Mozilla/5.0'}
         res = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=5)
         data = res.json()
         us_stocks = [f"{item['ticker']} - {item['title'].title()}" for item in data.values()]
@@ -96,7 +95,7 @@ def load_us_stock_library():
 
 STOCK_LIBRARY = load_us_stock_library()
 
-# 常用股票真实股本硬编码兜底表 (防止 API 彻底封锁时换手率错乱)
+# 精确股本字典 (单位：股)
 PRESET_FLOATS = {
     "BTDR": 123715025,
     "AAPL": 15200000000,
@@ -108,25 +107,40 @@ PRESET_FLOATS = {
 }
 
 # ==========================================
-# ⚙️ 3. 核心量化引擎 (精准股本换手率 + 防封锁)
+# 🚀 3. 极速 API 抓取引擎 (解决 N/A 与限流问题)
 # ==========================================
+def fetch_yahoo_chart_api(symbol):
+    """利用 Yahoo 官方前端 Chart v8 API 获取实时价格与涨跌幅 (永不封锁)"""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
+        headers = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)'}
+        res = requests.get(url, headers=headers, timeout=3)
+        if res.status_code == 200:
+            meta = res.json()['chart']['result'][0]['meta']
+            price = meta.get('regularMarketPrice', 0.0)
+            prev = meta.get('chartPreviousClose', meta.get('previousClose', price))
+            pct = (price / prev - 1) if prev else 0.0
+            return price, pct
+    except Exception:
+        pass
+    return 0.0, 0.0
+
 @st.cache_data(ttl=300)
 def get_enhanced_market_data(ticker_symbol):
     try:
         hist = pd.DataFrame()
         info = {}
         
-        # --- 抓取尝试 1: Yahoo Finance + TLS 指纹伪造 ---
+        # --- 1. 获取核心 K 线数据 (先尝试 yfinance，失败用 Stooq) ---
         try:
-            session = cffi_requests.Session(impersonate="chrome110")
-            tk = yf.Ticker(ticker_symbol, session=session)
+            tk = yf.Ticker(ticker_symbol)
             hist = tk.history(period="100d", interval="1d")
             try: info = tk.info
             except: info = {}
         except Exception:
             hist = pd.DataFrame()
 
-        # --- 抓取尝试 2: 兜底数据源 Stooq ---
+        # 兜底 Stooq 源
         if hist.empty:
             try:
                 stooq_code = f"{ticker_symbol}.US" if "^" not in ticker_symbol and "." not in ticker_symbol else ticker_symbol
@@ -136,30 +150,18 @@ def get_enhanced_market_data(ticker_symbol):
                 pass
 
         if hist.empty:
-            return "所有数据源访问均失败，可能触发频繁限制，请稍后再试。"
+            return "所有数据源访问均失败，请稍后再试。"
 
-        # 宏观指标辅助函数
-        def safe_get_macro(sym):
-            try:
-                m_df = web.DataReader(f"{sym}.US" if sym=="^IXIC" else sym, 'stooq').head(2)
-                if not m_df.empty and len(m_df) >= 2:
-                    p = m_df['Close'].iloc[-1]
-                    p_prev = m_df['Close'].iloc[-2]
-                    return p, (p / p_prev - 1)
-            except Exception:
-                pass
-            return 0.0, 0.0
+        # --- 2. 抓取顶部宏观指标 (Yahoo Chart API 极速保证) ---
+        btc, _ = fetch_yahoo_chart_api("BTC-USD")
+        nasdaq, nasdaq_pct = fetch_yahoo_chart_api("^IXIC")
+        vix, vix_pct = fetch_yahoo_chart_api("^VIX")
 
-        btc, _ = safe_get_macro("BTC-USD")
-        nasdaq, nasdaq_pct = safe_get_macro("^IXIC")
-        vix, vix_pct = safe_get_macro("^VIX")
-
-        # 期权数据抓取
+        # --- 3. 期权数据抓取 (容错机制) ---
         calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
         current_exp, pcr_value = "N/A", "N/A"
         try:
-            session = cffi_requests.Session(impersonate="chrome110")
-            tk_opt = yf.Ticker(ticker_symbol, session=session)
+            tk_opt = yf.Ticker(ticker_symbol)
             exp_dates = tk_opt.options
             if exp_dates:
                 today_str = datetime.now().strftime('%Y-%m-%d')
@@ -183,14 +185,13 @@ def get_enhanced_market_data(ticker_symbol):
         except Exception:
             pass
 
-        # --- 精准股本获取逻辑 ---
+        # --- 4. 精准流通股本与换手率计算 ---
         current_float = None
         if ticker_symbol in PRESET_FLOATS:
             current_float = PRESET_FLOATS[ticker_symbol]
         elif info:
             current_float = info.get('floatShares') or info.get('sharesOutstanding')
 
-        # 数据清洗与指标计算
         hist.index = pd.to_datetime(hist.index).date
         hist['昨收'] = hist['Close'].shift(1)
         hist['MA5'] = hist['Close'].rolling(5).mean()
@@ -198,7 +199,7 @@ def get_enhanced_market_data(ticker_symbol):
         std20 = hist['Close'].rolling(20).std()
         hist['Upper'], hist['Lower'] = hist['MA20'] + std20*2, hist['MA20'] - std20*2
         
-        # 换手率计算 (严格校验股本有效性)
+        # 换手率计算
         if current_float and current_float > 0:
             hist['换手率_raw'] = (hist['Volume'] / current_float)
         else:
@@ -274,8 +275,8 @@ elif data:
     # 全球宏观看板
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Bitcoin", f"${mkt['btc']:,.0f}" if mkt['btc'] > 0 else "N/A")
-    m2.metric("Nasdaq", f"{mkt['nasdaq']:,.2f}" if mkt['nasdaq'] > 0 else "N/A", f"{mkt['nasdaq_pct']:.2%}")
-    m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}" if mkt['vix'] > 0 else "N/A", f"{mkt['vix_pct']:.2%}", delta_color="inverse")
+    m2.metric("Nasdaq", f"{mkt['nasdaq']:,.2f}" if mkt['nasdaq'] > 0 else "N/A", f"{mkt['nasdaq_pct']:.2%}" if mkt['nasdaq'] > 0 else "N/A")
+    m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}" if mkt['vix'] > 0 else "N/A", f"{mkt['vix_pct']:.2%}" if mkt['vix'] > 0 else "N/A", delta_color="inverse")
     m4.metric(f"{ticker} 现价", f"${last['Close']:.2f}", f"{(last['Close']/last['昨收']-1):.2%}" if pd.notnull(last['昨收']) else "N/A")
 
     st.divider()
@@ -288,7 +289,7 @@ elif data:
             turnover_rate = (mkt['volume']/mkt['float'])*100
             st.write(f"实时换手: **{turnover_rate:.2f}%**")
         else:
-            st.write("实时换手: **N/A (无股本数据)**")
+            st.write("实时换手: **N/A (接口限流暂未获取到股本)**")
         st.write(f"BOLL 高/低: **{last['Upper']:.2f} / {last['Lower']:.2f}**")
         st.write(f"资金 MFI: **{last['MFI']:.2f}**")
     with c2:
@@ -315,7 +316,6 @@ elif data:
     
     colors = ['#E53935' if (p_df['Close'].iloc[i] >= p_df['Open'].iloc[i]) else '#43A047' for i in range(len(p_df))]
     
-    # 柱状图：有换手率显示换手率，无则回退显示成交量(万股)
     if p_df['换手率_raw'].notnull().any():
         fig.add_trace(go.Bar(x=p_df['label'], y=p_df['换手率_raw']*100, marker_color=colors, name="换手%"), row=2, col=1)
     else:
