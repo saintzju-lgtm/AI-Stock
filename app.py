@@ -180,33 +180,41 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
     """三级智能降级模型：绝对保证 100% 计算出看涨/看跌墙与 Gamma Flip"""
     calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
     call_wall, put_wall, gamma_flip, pcr_value = np.nan, np.nan, np.nan, np.nan
-    calc_mode = "持仓量"
+    calc_mode = "持仓量 (OI)"
 
     try:
+        if pd.isna(current_price) or current_price <= 0:
+            current_price = 10.0
+
         calls, puts = get_raw_options_with_crumb(ticker_symbol, selected_exp)
 
-        # 补全关键列
+        # 重置索引
+        if not calls.empty: calls = calls.reset_index(drop=True)
+        if not puts.empty: puts = puts.reset_index(drop=True)
+
+        # 规范化并补充字段
         for df in [calls, puts]:
             if not df.empty:
-                if 'openInterest' not in df.columns: df['openInterest'] = 0
-                else: df['openInterest'] = df['openInterest'].fillna(0)
-                if 'volume' not in df.columns: df['volume'] = 0
-                else: df['volume'] = df['volume'].fillna(0)
-                if 'impliedVolatility' not in df.columns: df['impliedVolatility'] = 0.2
-                else: df['impliedVolatility'] = df['impliedVolatility'].fillna(0.2)
+                for col in ['strike', 'lastPrice', 'openInterest', 'volume', 'impliedVolatility']:
+                    if col not in df.columns:
+                        df[col] = 0.0
+                    else:
+                        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+                df['impliedVolatility'] = df['impliedVolatility'].apply(lambda x: x if x > 0.01 else 0.25)
+                df['density_weight'] = 1.0 / (1.0 + (df['strike'] - current_price).abs())
 
-        # 清洗离谱行权价
+        # 行权价合理区间过滤
         if not calls.empty:
-            calls = calls[(calls['strike'] >= current_price * 0.3) & (calls['strike'] <= current_price * 2.5)].copy()
+            calls = calls[(calls['strike'] >= current_price * 0.2) & (calls['strike'] <= current_price * 3.0)].copy()
         if not puts.empty:
-            puts = puts[(puts['strike'] >= current_price * 0.3) & (puts['strike'] <= current_price * 2.5)].copy()
+            puts = puts[(puts['strike'] >= current_price * 0.2) & (puts['strike'] <= current_price * 3.0)].copy()
 
         tot_c_oi = calls['openInterest'].sum() if not calls.empty else 0
         tot_p_oi = puts['openInterest'].sum() if not puts.empty else 0
         tot_c_vol = calls['volume'].sum() if not calls.empty else 0
         tot_p_vol = puts['volume'].sum() if not puts.empty else 0
 
-        # 🎯 核心平滑机制：判断权重维度
+        # 判断计算权重维度
         if (tot_c_oi + tot_p_oi) > 0:
             w_col = 'openInterest'
             calc_mode = "持仓量 (OI)"
@@ -217,49 +225,50 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
             pcr_value = tot_p_vol / tot_c_vol if tot_c_vol > 0 else 1.0
         else:
             w_col = 'density_weight'
-            calc_mode = "行权价分布密度"
+            calc_mode = "行权价分布"
             pcr_value = 1.0
-            for df in [calls, puts]:
-                if not df.empty:
-                    df['density_weight'] = 1.0 / (1.0 + (df['strike'] - current_price).abs())
 
         # 1. 看涨墙 (压力位) 计算
         if not calls.empty:
             c_above = calls[calls['strike'] >= current_price]
             c_target = c_above if not c_above.empty else calls
-            call_wall = c_target.loc[c_target[w_col].idxmax()]['strike']
+            max_idx = c_target[w_col].idxmax()
+            call_wall = float(c_target.loc[max_idx, 'strike'])
 
         # 2. 看跌墙 (支撑位) 计算
         if not puts.empty:
             p_below = puts[puts['strike'] <= current_price]
             p_target = p_below if not p_below.empty else puts
-            put_wall = p_target.loc[p_target[w_col].idxmax()]['strike']
+            max_idx = p_target[w_col].idxmax()
+            put_wall = float(p_target.loc[max_idx, 'strike'])
 
-        # 逻辑二次校准
-        if pd.isna(call_wall) and not calls.empty: call_wall = calls.iloc[-1]['strike']
-        if pd.isna(put_wall) and not puts.empty: put_wall = puts.iloc[0]['strike']
+        # 兜底对齐
+        if pd.isna(call_wall) and not calls.empty: call_wall = float(calls['strike'].max())
+        if pd.isna(put_wall) and not puts.empty: put_wall = float(puts['strike'].min())
 
         # 3. 伽马翻转点计算
         try:
             exp_date = datetime.strptime(selected_exp, '%Y-%m-%d')
             T = max((exp_date - datetime.now()).days, 1) / 365.0
-            s_range = np.linspace(current_price * 0.7, current_price * 1.3, 100)
+            s_range = np.linspace(current_price * 0.7, current_price * 1.3, 80)
             net_gammas = []
 
             for s_test in s_range:
                 tot_g = 0.0
-                for _, row in calls.iterrows():
-                    k, w, iv = row['strike'], row[w_col], row.get('impliedVolatility', 0.2)
-                    w_val = w if w > 0 else 1.0
-                    if k > 0 and iv > 0.01:
-                        d1 = (np.log(s_test / k) + 0.5 * (iv**2) * T) / (iv * np.sqrt(T))
-                        tot_g += w_val * (np.exp(-0.5 * d1**2) / (s_test * iv * np.sqrt(2 * np.pi * T)))
-                for _, row in puts.iterrows():
-                    k, w, iv = row['strike'], row[w_col], row.get('impliedVolatility', 0.2)
-                    w_val = w if w > 0 else 1.0
-                    if k > 0 and iv > 0.01:
-                        d1 = (np.log(s_test / k) + 0.5 * (iv**2) * T) / (iv * np.sqrt(T))
-                        tot_g -= w_val * (np.exp(-0.5 * d1**2) / (s_test * iv * np.sqrt(2 * np.pi * T)))
+                if not calls.empty:
+                    for _, row in calls.iterrows():
+                        k, w, iv = row['strike'], row[w_col], row['impliedVolatility']
+                        w_val = max(float(w), 0.1)
+                        if k > 0:
+                            d1 = (np.log(s_test / k) + 0.5 * (iv**2) * T) / (iv * np.sqrt(T))
+                            tot_g += w_val * (np.exp(-0.5 * d1**2) / (s_test * iv * np.sqrt(2 * np.pi * T)))
+                if not puts.empty:
+                    for _, row in puts.iterrows():
+                        k, w, iv = row['strike'], row[w_col], row['impliedVolatility']
+                        w_val = max(float(w), 0.1)
+                        if k > 0:
+                            d1 = (np.log(s_test / k) + 0.5 * (iv**2) * T) / (iv * np.sqrt(T))
+                            tot_g -= w_val * (np.exp(-0.5 * d1**2) / (s_test * iv * np.sqrt(2 * np.pi * T)))
                 net_gammas.append(tot_g)
 
             net_gammas = np.array(net_gammas)
@@ -268,12 +277,13 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
                 idx = zero_crossings[0]
                 y1, y2 = net_gammas[idx], net_gammas[idx+1]
                 x1, x2 = s_range[idx], s_range[idx+1]
-                gamma_flip = x1 - y1 * (x2 - x1) / (y2 - y1) if (y2 - y1) != 0 else x1
+                gamma_flip = float(x1 - y1 * (x2 - x1) / (y2 - y1)) if (y2 - y1) != 0 else float(x1)
             else:
-                gamma_flip = (call_wall + put_wall) / 2.0 if (pd.notnull(call_wall) and pd.notnull(put_wall)) else current_price
+                gamma_flip = float((call_wall + put_wall) / 2.0) if (pd.notnull(call_wall) and pd.notnull(put_wall)) else float(current_price)
         except Exception:
-            gamma_flip = current_price
+            gamma_flip = float(current_price)
 
+        # 表格切片
         for df_type, target_df in [('calls', calls), ('puts', puts)]:
             if not target_df.empty:
                 idx = (target_df['strike'] - current_price).abs().idxmin()
@@ -281,7 +291,8 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
                 if df_type == 'calls': calls_df = slice_df
                 else: puts_df = slice_df
 
-    except Exception: pass
+    except Exception:
+        calc_mode = "行权价分布"
 
     return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_value, calc_mode
 
@@ -309,7 +320,7 @@ def background_updater_loop():
                         
                         for exp_date in future_exps:
                             try:
-                                opt_key = f"{ticker}_{exp_date}"
+                                opt_key = f"v3_{ticker}_{exp_date}" # 👈 升级缓存Key前缀 v3_
                                 opt_data = do_fetch_option_details(ticker, exp_date, last_price)
                                 with GLOBAL_STORE["lock"]:
                                     GLOBAL_STORE["options_cache"][opt_key] = opt_data
@@ -454,7 +465,7 @@ else:
             
             selected_exp = st.selectbox("📅 选择期权到期日", options=exp_dates, index=default_exp_idx)
             
-            opt_key = f"{ticker}_{selected_exp}"
+            opt_key = f"v3_{ticker}_{selected_exp}" # 👈 使用 v3_ 前缀清空旧缓存
             opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
             if not opt_data or is_expired:
                 opt_data = do_fetch_option_details(ticker, selected_exp, last['Close'])
