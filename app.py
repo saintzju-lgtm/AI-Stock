@@ -32,11 +32,11 @@ PRESET_FLOATS = {
 # ==========================================
 @st.cache_resource
 def get_global_data_store():
-    """全局共享内存：前端页面无论怎么刷新，都只从这里读取数据，零外部 API 开销"""
+    """全局共享内存：前端页面无论怎么刷新、点哪个期权到期日，都只读内存"""
     return {
         "stock_cache": {},        # 结构: { "BTDR": (hist, reg, dark, exp_dates, mkt) }
         "options_cache": {},      # 结构: { "BTDR_2026-08-21": (calls, puts, wall_c, wall_p, flip, pcr) }
-        "active_queue": set(["BTDR", "AAPL", "TSLA", "NVDA"]), # 后台守护线程轮询队列
+        "active_queue": set(["BTDR", "AAPL", "TSLA", "NVDA"]), # 后台轮询股票队列
         "last_updated": 0,
         "lock": threading.Lock()
     }
@@ -88,7 +88,7 @@ def fetch_macro_api(symbol, stooq_symbol):
     return 0.0, 0.0
 
 def do_fetch_stock_data(ticker_symbol):
-    """后台线程调用的股票与核心指标抓取逻辑"""
+    """后台抓取股票与核心指标"""
     try:
         hist = pd.DataFrame()
         info = {}
@@ -155,7 +155,7 @@ def do_fetch_stock_data(ticker_symbol):
         return None
 
 def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
-    """后台抓取全景期权（含看涨墙、看跌墙、伽马翻转点、PCR）"""
+    """后台计算期权指标（看涨/看跌墙、伽马翻转点、PCR）"""
     calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
     call_wall, put_wall, gamma_flip, pcr_value = np.nan, np.nan, np.nan, np.nan
     try:
@@ -216,25 +216,41 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
     return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_value
 
 # ==========================================
-# 🔄 4. 异步守护线程 (平滑排队拉取)
+# 🔄 4. 异步全量守护线程 (全量预载期权)
 # ==========================================
 def background_updater_loop():
-    """守护线程：循环轮询队列中的股票，严格控频防封"""
+    """守护线程：不仅处理股票K线，还自动预载近期的期权链，实现完全无感调用"""
     while True:
         with GLOBAL_STORE["lock"]:
             tickers_to_process = list(GLOBAL_STORE["active_queue"])
         
         for ticker in tickers_to_process:
+            # 1. 抓取股票核心数据
             data = do_fetch_stock_data(ticker)
             if data:
                 with GLOBAL_STORE["lock"]:
                     GLOBAL_STORE["stock_cache"][ticker] = data
-            time.sleep(2.5) # 极度平滑的请求间隔，保护 IP 永不受限制
+                
+                hist_df, _, _, exp_dates, _ = data
+                last_price = hist_df['Close'].iloc[-1]
+                
+                # 2. 【核心升级】：后台自动预抓取前 4 个到期日的期权链数据（覆盖绝大多数交易场景）
+                today_str = datetime.now().strftime('%Y-%m-%d')
+                future_exps = [ed for ed in exp_dates if ed >= today_str][:4]
+                
+                for exp_date in future_exps:
+                    opt_key = f"{ticker}_{exp_date}"
+                    opt_data = do_fetch_option_details(ticker, exp_date, last_price)
+                    with GLOBAL_STORE["lock"]:
+                        GLOBAL_STORE["options_cache"][opt_key] = opt_data
+                    time.sleep(1.2) # 期权链抓取缓冲（极度安全控频）
+
+            time.sleep(2.5) # 股票请求控频缓冲
         
         with GLOBAL_STORE["lock"]:
             GLOBAL_STORE["last_updated"] = time.time()
             
-        time.sleep(180) # 3 分钟一轮全量轮询
+        time.sleep(180) # 3 分钟进行下一轮全量更新
 
 @st.cache_resource
 def start_background_engine():
@@ -269,7 +285,6 @@ with st.sidebar:
     new_tk = selected_item.split(" - ")[0].strip()
     if new_tk and new_tk != st.session_state.current_ticker:
         st.session_state.current_ticker = new_tk
-        # 将新选股票加入后台队列
         with GLOBAL_STORE["lock"]:
             GLOBAL_STORE["active_queue"].add(new_tk)
         st.rerun()
@@ -277,18 +292,18 @@ with st.sidebar:
 ticker = st.session_state.current_ticker
 st.title(f"🎯 {ticker} 专业量化决策终端")
 
-# 🔒 【核心解耦点】：前端只读全局共享内存，不主动发起 API 请求
+# 🔒 【核心解耦点】：前端只读共享内存，绝不上网请求
 stock_data = GLOBAL_STORE["stock_cache"].get(ticker)
 
 if not stock_data:
-    st.info(f"⏳ 后台引擎正在为您同步抓取 **{ticker}** 核心数据，请等待 3 秒后手动刷新页面...")
+    st.info(f"⏳ 后台线程正在为您同步预载 **{ticker}** 股票与期权数据，请等待 3~5 秒后刷新...")
 else:
     hist_df, reg, dark_df, exp_dates, mkt = stock_data
     last = hist_df.iloc[-1]
     
-    # 顶部状态条
+    # 顶部状态栏
     updated_str = datetime.fromtimestamp(GLOBAL_STORE["last_updated"]).strftime('%H:%M:%S') if GLOBAL_STORE["last_updated"] > 0 else "初始化中"
-    st.caption(f"🟢 硬件级防封保护中 | 本地缓存更新于: **{updated_str}** | 当前数据源: **{mkt['source']}**")
+    st.caption(f"🟢 全量解耦隔离中 | 本地缓存更新于: **{updated_str}** | 当前数据源: **{mkt['source']}**")
     
     # 全球宏观看板
     m1, m2, m3, m4 = st.columns(4)
@@ -361,30 +376,32 @@ else:
             
             selected_exp = st.selectbox("📅 选择期权到期日", options=exp_dates, index=default_exp_idx)
             
-            # 缓存机制读取期权数据，防止重复算 Gamma Flip
+            # 🔒 【核心提升】：直接从后台预载的 options_cache 提取，完全不需要发起网络请求
             opt_key = f"{ticker}_{selected_exp}"
-            if opt_key not in GLOBAL_STORE["options_cache"]:
-                GLOBAL_STORE["options_cache"][opt_key] = do_fetch_option_details(ticker, selected_exp, last['Close'])
+            opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
             
-            calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_val = GLOBAL_STORE["options_cache"][opt_key]
-            
-            q1, q2, q3, q4 = st.columns(4)
-            q1.metric("🧱 看涨墙 (Call Wall)", f"${call_wall:.2f}" if pd.notnull(call_wall) else "N/A")
-            q2.metric("🧱 看跌墙 (Put Wall)", f"${put_wall:.2f}" if pd.notnull(put_wall) else "N/A")
-            q3.metric("🌀 伽马翻转点", f"${gamma_flip:.2f}" if pd.notnull(gamma_flip) else "N/A")
-            q4.metric("📊 Put/Call Ratio", f"{pcr_val:.2f}" if pd.notnull(pcr_val) else "N/A")
+            if opt_data:
+                calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_val = opt_data
+                
+                q1, q2, q3, q4 = st.columns(4)
+                q1.metric("🧱 看涨墙 (Call Wall)", f"${call_wall:.2f}" if pd.notnull(call_wall) else "N/A")
+                q2.metric("🧱 看跌墙 (Put Wall)", f"${put_wall:.2f}" if pd.notnull(put_wall) else "N/A")
+                q3.metric("🌀 伽马翻转点", f"${gamma_flip:.2f}" if pd.notnull(gamma_flip) else "N/A")
+                q4.metric("📊 Put/Call Ratio", f"{pcr_val:.2f}" if pd.notnull(pcr_val) else "N/A")
 
-            t1, t2 = st.tabs(["📈 看涨 (Calls)", "📉 看跌 (Puts)"])
-            with t1: 
-                if not calls_df.empty: 
-                    st.dataframe(calls_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
-                else: 
-                    st.info("该到期日暂无看涨期权数据")
-            with t2: 
-                if not puts_df.empty: 
-                    st.dataframe(puts_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
-                else: 
-                    st.info("该到期日暂无看跌期权数据")
+                t1, t2 = st.tabs(["📈 看涨 (Calls)", "📉 看跌 (Puts)"])
+                with t1: 
+                    if not calls_df.empty: 
+                        st.dataframe(calls_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
+                    else: 
+                        st.info("该到期日暂无看涨期权数据")
+                with t2: 
+                    if not puts_df.empty: 
+                        st.dataframe(puts_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
+                    else: 
+                        st.info("该到期日暂无看跌期权数据")
+            else:
+                st.info("⏳ 后台正在排队预载该远期期权数据，请片刻后刷新...")
         else:
             st.info("💡 当前为 Stooq 备用源模式或该股票暂无期权链交易。")
             
