@@ -6,15 +6,18 @@ from sklearn.linear_model import LinearRegression
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import threading
 import requests
 import pandas_datareader.data as web
 
 # ==========================================
-# 0. 页面全局配置 (必须放在第一行)
+# 0. 页面全局配置与时区定义
 # ==========================================
 st.set_page_config(layout="wide", page_title="专业量化决策终端")
+
+# 定义北京时间 (UTC+8)
+BEIJING_TZ = timezone(timedelta(hours=8))
 
 # 精确股本字典 (单位：股)
 PRESET_FLOATS = {
@@ -87,7 +90,7 @@ def fetch_macro_api(symbol, stooq_symbol):
     return 0.0, 0.0
 
 def do_fetch_stock_data(ticker_symbol):
-    """抓取股票与核心指标（带全重兜底保护）"""
+    """抓取股票与核心指标"""
     try:
         hist = pd.DataFrame()
         info = {}
@@ -218,7 +221,6 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
 # 🔄 4. 永不崩溃的后台守护线程
 # ==========================================
 def background_updater_loop():
-    """后台独立轮询：全量 try-except 保护，即使报错也绝不会死锁掉线"""
     while True:
         try:
             with GLOBAL_STORE["lock"]:
@@ -226,13 +228,11 @@ def background_updater_loop():
             
             for ticker in tickers_to_process:
                 try:
-                    # 1. 优先抢抓股票 K 线数据（毫秒级写入，保证页面秒开）
                     data = do_fetch_stock_data(ticker)
                     if data:
                         with GLOBAL_STORE["lock"]:
                             GLOBAL_STORE["stock_cache"][ticker] = data
                         
-                        # 2. 抓完 K 线后，后台顺带预抓近 2 个期权到期日
                         hist_df, _, _, exp_dates, _ = data
                         last_price = hist_df['Close'].iloc[-1]
                         today_str = datetime.now().strftime('%Y-%m-%d')
@@ -248,13 +248,13 @@ def background_updater_loop():
                             except Exception: pass
 
                 except Exception: pass
-                time.sleep(2.0) # 请求安全缓冲
+                time.sleep(2.0)
             
             with GLOBAL_STORE["lock"]:
                 GLOBAL_STORE["last_updated"] = time.time()
                 
         except Exception: pass
-        time.sleep(180) # 3 分钟一轮循环
+        time.sleep(180)
 
 @st.cache_resource
 def start_background_engine():
@@ -265,7 +265,7 @@ def start_background_engine():
 start_background_engine()
 
 # ==========================================
-# 🖥️ 5. 纯前端 UI 渲染层 (带自动同步兜底)
+# 🖥️ 5. 纯前端 UI 渲染层
 # ==========================================
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; } </style>""", unsafe_allow_html=True)
 
@@ -299,7 +299,7 @@ st.title(f"🎯 {ticker} 专业量化决策终端")
 # 读取内存缓存
 stock_data = GLOBAL_STORE["stock_cache"].get(ticker)
 
-# 🛠️ 【核心同步兜底】：如果后台线程还没排队到当前股票，主线程强行同步抓取一次并写入内存，彻底杜绝死等！
+# 紧急同步兜底
 if not stock_data:
     with st.spinner(f"🚀 首次加载 {ticker}，正在紧急同步数据..."):
         stock_data = do_fetch_stock_data(ticker)
@@ -314,9 +314,14 @@ else:
     hist_df, reg, dark_df, exp_dates, mkt = stock_data
     last = hist_df.iloc[-1]
     
-    # 顶部状态栏
-    updated_str = datetime.fromtimestamp(GLOBAL_STORE["last_updated"]).strftime('%H:%M:%S') if GLOBAL_STORE["last_updated"] > 0 else "实时"
-    st.caption(f"🟢 数据解耦防护中 | 内存缓存更新于: **{updated_str}** | 数据源: **{mkt['source']}**")
+    # 🕒 【时区转换修正】：精确计算北京时间展示
+    if GLOBAL_STORE["last_updated"] > 0:
+        updated_dt = datetime.fromtimestamp(GLOBAL_STORE["last_updated"], tz=timezone.utc).astimezone(BEIJING_TZ)
+    else:
+        updated_dt = datetime.now(BEIJING_TZ)
+    
+    beijing_time_str = updated_dt.strftime('%H:%M:%S')
+    st.caption(f"🟢 数据解耦防护中 | 内存缓存更新于 (北京时间): **{beijing_time_str}** | 数据源: **{mkt['source']}**")
     
     # 全球宏观看板
     m1, m2, m3, m4 = st.columns(4)
@@ -389,7 +394,6 @@ else:
             
             selected_exp = st.selectbox("📅 选择期权到期日", options=exp_dates, index=default_exp_idx)
             
-            # 期权数据读取（内存无则同步触发一次补存）
             opt_key = f"{ticker}_{selected_exp}"
             opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
             if not opt_data:
