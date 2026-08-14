@@ -107,10 +107,10 @@ PRESET_FLOATS = {
 }
 
 # ==========================================
-# 🚀 3. 极速 API 抓取引擎 (解决 N/A 与限流问题)
+# 🚀 3. 极速 API 抓取引擎
 # ==========================================
 def fetch_yahoo_chart_api(symbol):
-    """利用 Yahoo 官方前端 Chart v8 API 获取实时价格与涨跌幅 (永不封锁)"""
+    """利用 Yahoo 官方前端 Chart v8 API 获取实时价格与涨跌幅 (防封锁)"""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
         headers = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)'}
@@ -131,7 +131,7 @@ def get_enhanced_market_data(ticker_symbol):
         hist = pd.DataFrame()
         info = {}
         
-        # --- 1. 获取核心 K 线数据 (先尝试 yfinance，失败用 Stooq) ---
+        # --- 1. 获取核心 K 线数据 ---
         try:
             tk = yf.Ticker(ticker_symbol)
             hist = tk.history(period="100d", interval="1d")
@@ -152,12 +152,12 @@ def get_enhanced_market_data(ticker_symbol):
         if hist.empty:
             return "所有数据源访问均失败，请稍后再试。"
 
-        # --- 2. 抓取顶部宏观指标 (Yahoo Chart API 极速保证) ---
+        # --- 2. 抓取顶部宏观指标 ---
         btc, _ = fetch_yahoo_chart_api("BTC-USD")
         nasdaq, nasdaq_pct = fetch_yahoo_chart_api("^IXIC")
         vix, vix_pct = fetch_yahoo_chart_api("^VIX")
 
-        # --- 3. 期权数据抓取 (容错机制) ---
+        # --- 3. 期权数据抓取 ---
         calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
         current_exp, pcr_value = "N/A", "N/A"
         try:
@@ -289,7 +289,7 @@ elif data:
             turnover_rate = (mkt['volume']/mkt['float'])*100
             st.write(f"实时换手: **{turnover_rate:.2f}%**")
         else:
-            st.write("实时换手: **N/A (接口限流暂未获取到股本)**")
+            st.write("实时换手: **N/A (无股本数据)**")
         st.write(f"BOLL 高/低: **{last['Upper']:.2f} / {last['Lower']:.2f}**")
         st.write(f"资金 MFI: **{last['MFI']:.2f}**")
     with c2:
@@ -297,8 +297,10 @@ elif data:
         ratio_o = (last['Open'] - last['昨收']) / last['昨收'] if last['昨收'] > 0 else 0
         p_h = last['昨收'] * (1 + (reg['i_h'] + reg['s_h'] * ratio_o))
         p_l = last['昨收'] * (1 + (reg['i_l'] + reg['s_l'] * ratio_o))
+        
+        # 👉 已替换场景名称为：乐观、中性、悲观
         st.table(pd.DataFrame({
-            "场景": ["看空失效", "中性回归", "支撑测试"], 
+            "场景": ["乐观", "中性", "悲观"], 
             "压力参考": [p_h*1.06, p_h, p_h*0.94], 
             "支撑参考": [p_l*1.06, p_l, p_l*0.94]
         }).style.format(precision=2))
