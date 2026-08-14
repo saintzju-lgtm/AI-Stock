@@ -287,7 +287,9 @@ elif data:
     st.divider()
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
     p_df = hist_df.tail(40).copy()
-    p_df['label'] = pd.to_datetime(p_df.index).dt.strftime('%m-%d')
+    
+    # 【已修复】针对 Index 类型正确的 strftime 转换格式
+    p_df['label'] = pd.to_datetime(p_df.index).strftime('%m-%d')
     
     fig.add_trace(go.Scatter(x=p_df['label'], y=p_df['Upper'], line=dict(color='rgba(0,102,204,0.3)'), name=f"High:{last['Upper']:.2f}"), row=1, col=1)
     fig.add_trace(go.Scatter(x=p_df['label'], y=p_df['Lower'], line=dict(color='rgba(0,102,204,0.3)'), fill='tonexty', name=f"Low:{last['Lower']:.2f}"), row=1, col=1)
