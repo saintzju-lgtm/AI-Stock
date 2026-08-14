@@ -160,6 +160,140 @@ def get_live_quote(ticker_symbol):
         return None, None
 
 
+def build_scenario_model(hist_df):
+    """
+    组合优化版"场景回归预测"模型(替换原来"单变量OLS + 固定±6%"的做法):
+
+    B. 分位数回归(Quantile Regression):直接对 High/Low 相对昨收的涨跌幅分别拟合
+       90%/50%/10% 三条分位数线,作为"乐观/中性/悲观"三个场景,天然带概率含义,
+       不再是"中性值 × 拍脑袋的固定百分比"。
+
+    A. 波动率自适应:把"近10日实际波动率"也作为回归自变量之一(而不是只用开盘跳空幅度),
+       这样区间会随这只股票当前的真实波动状态自动收窄/放宽,不再是所有股票、所有时期用同一套宽度。
+
+    小样本兜底:数据不够(新股/次新股历史太短)或分位数回归本身失败时,自动退回原来的
+    简单线性回归 + 固定百分比,保证页面不会因为模型失败而空白或崩溃。
+    """
+    fit_df = hist_df.dropna().copy()
+    if len(fit_df) < 15:
+        return {'mode': 'insufficient'}
+
+    fit_df['gap'] = (fit_df['Open'] - fit_df['昨收']) / fit_df['昨收']
+    ret = fit_df['Close'].pct_change()
+    fit_df['recent_vol'] = ret.rolling(10).std()
+    fit_df = fit_df.dropna(subset=['gap', 'recent_vol'])
+
+    if len(fit_df) < 15:
+        return {'mode': 'insufficient'}
+
+    y_h = (fit_df['High'] / fit_df['昨收'] - 1).values
+    y_l = (fit_df['Low'] / fit_df['昨收'] - 1).values
+
+    if len(fit_df) >= 25:
+        try:
+            from sklearn.linear_model import QuantileRegressor
+            X = fit_df[['gap', 'recent_vol']].values
+            quantile_map = {'乐观': 0.9, '中性': 0.5, '悲观': 0.1}
+            models = {'h': {}, 'l': {}}
+            for scene, q in quantile_map.items():
+                # alpha 是L1正则强度,样本量不大时加一点正则避免系数被少数点带偏
+                models['h'][scene] = QuantileRegressor(quantile=q, alpha=0.3, solver='highs').fit(X, y_h)
+                models['l'][scene] = QuantileRegressor(quantile=q, alpha=0.3, solver='highs').fit(X, y_l)
+            return {'mode': 'quantile', 'models': models}
+        except Exception:
+            pass  # 分位数回归失败(比如scipy版本太旧不支持highs求解器),落到下面的兜底
+
+    # 兜底方案:样本不足或分位数回归失败,退回原来的简单线性回归 + 固定百分比
+    X_simple = fit_df[['gap']].values
+    fallback = {}
+    for tag, y in [('h', y_h), ('l', y_l)]:
+        m = LinearRegression().fit(X_simple, y)
+        fallback[f's_{tag}'], fallback[f'i_{tag}'] = m.coef_[0], m.intercept_
+    return {'mode': 'linear_fallback', 'params': fallback}
+
+
+def predict_scenarios(scenario_model, hist_df):
+    """根据 build_scenario_model 产出的模型,结合最新一天数据,算出三档场景的压力/支撑参考价。"""
+    if not scenario_model or scenario_model.get('mode') == 'insufficient':
+        return None, 'insufficient'
+
+    last = hist_df.iloc[-1]
+    prev_close = last['昨收']
+    if pd.isna(prev_close) or prev_close <= 0:
+        return None, 'insufficient'
+
+    gap = (last['Open'] - prev_close) / prev_close
+
+    if scenario_model['mode'] == 'quantile':
+        ret = hist_df['Close'].pct_change()
+        recent_vol = ret.rolling(10).std().iloc[-1]
+        if pd.isna(recent_vol):
+            recent_vol = ret.std()
+        X_pred = np.array([[gap, recent_vol]])
+        models = scenario_model['models']
+
+        h_vals = {scene: prev_close * (1 + models['h'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
+        l_vals = {scene: prev_close * (1 + models['l'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
+
+        # 分位数回归在小样本下偶尔会出现"分位数交叉"(比如10%分位算出来比50%分位还高),
+        # 这里做一次排序兜底,保证"乐观>中性>悲观"这个顺序始终符合直觉。
+        h_sorted = sorted(h_vals.values(), reverse=True)
+        l_sorted = sorted(l_vals.values(), reverse=True)
+        rows = [(scene, h_sorted[i], l_sorted[i]) for i, scene in enumerate(['乐观', '中性', '悲观'])]
+        return rows, 'quantile'
+
+    if scenario_model['mode'] == 'linear_fallback':
+        p = scenario_model['params']
+        p_h = prev_close * (1 + (p['i_h'] + p['s_h'] * gap))
+        p_l = prev_close * (1 + (p['i_l'] + p['s_l'] * gap))
+        rows = [
+            ('乐观', p_h * 1.06, p_l * 1.06),
+            ('中性', p_h, p_l),
+            ('悲观', p_h * 0.94, p_l * 0.94),
+        ]
+        return rows, 'linear_fallback'
+
+    return None, 'insufficient'
+
+
+def estimate_iv_expected_move(ticker_symbol, current_price):
+    """
+    C. 期权隐含波动率(IV)交叉参考:
+    找最近一个到期日里,离现价最近的平值(ATM)看涨/看跌期权,取其IV,
+    按 sqrt(时间) 换算成"1个交易日等效"的预期波动幅度——这是期权市场对未来波动的定价,
+    跟上面纯历史统计的分位数回归是两套独立信息源,放在一起可以互相印证,而不是只信一个模型。
+    """
+    try:
+        exp_list = get_expiration_list(ticker_symbol)
+        if not exp_list:
+            return None
+        nearest_exp = exp_list[0]
+
+        opt_key = f"{ticker_symbol}_{nearest_exp}"
+        opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
+        if not opt_data:
+            opt_data = do_fetch_option_details(ticker_symbol, nearest_exp, current_price)
+
+        calls_df, puts_df = opt_data[0], opt_data[1]
+        atm_ivs = []
+        for df in (calls_df, puts_df):
+            if df is not None and not df.empty:
+                idx = (df['strike'] - current_price).abs().idxmin()
+                iv = df.loc[idx, 'impliedVolatility']
+                if iv and iv > 0.01:
+                    atm_ivs.append(float(iv))
+
+        if not atm_ivs:
+            return None
+
+        atm_iv = float(np.mean(atm_ivs))
+        days_to_exp = max((datetime.strptime(nearest_exp, '%Y-%m-%d') - datetime.now()).days, 1)
+        move_1day = current_price * atm_iv * np.sqrt(1 / 365)
+        return {'atm_iv': atm_iv, 'nearest_exp': nearest_exp, 'days_to_exp': days_to_exp, 'move_1day': move_1day}
+    except Exception:
+        return None
+
+
 def do_fetch_stock_data(ticker_symbol):
     try:
         now_ts = time.time()
@@ -208,17 +342,12 @@ def do_fetch_stock_data(ticker_symbol):
         dark = hist[hist['Volume'] > avg_vol * 1.2].tail(8).copy()
         dark['Signal'] = dark.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
 
-        fit_df = hist.dropna()
-        X = ((fit_df['Open'] - fit_df['昨收']) / fit_df['昨收']).values.reshape(-1, 1)
-        reg_params = {}
-        for tag, target in [('h', 'High'), ('l', 'Low')]:
-            m = LinearRegression().fit(X, fit_df[target].values / fit_df['昨收'].values - 1)
-            reg_params[f's_{tag}'], reg_params[f'i_{tag}'] = m.coef_[0], m.intercept_
+        scenario_model = build_scenario_model(hist)
 
         live_price, live_volume = get_live_quote(ticker_symbol)
         volume_for_turnover = live_volume if (live_volume and live_volume > 0) else hist['Volume'].iloc[-1]
 
-        return hist, reg_params, dark, {
+        return hist, scenario_model, dark, {
             'btc': btc, 'nasdaq': nasdaq, 'nasdaq_pct': nasdaq_pct,
             'vix': vix, 'vix_pct': vix_pct,
             'float': current_float, 'float_label': float_label,
@@ -511,15 +640,33 @@ else:
         st.write(f"资金 MFI: **{last['MFI']:.2f}**")
     with c2:
         st.subheader("📍 场景回归预测")
-        ratio_o = (last['Open'] - last['昨收']) / last['昨收'] if last['昨收'] > 0 else 0
-        p_h = last['昨收'] * (1 + (reg['i_h'] + reg['s_h'] * ratio_o))
-        p_l = last['昨收'] * (1 + (reg['i_l'] + reg['s_l'] * ratio_o))
+        rows, mode = predict_scenarios(reg, hist_df)
 
-        st.table(pd.DataFrame({
-            "场景": ["乐观", "中性", "悲观"],
-            "压力参考": [p_h * 1.06, p_h, p_h * 0.94],
-            "支撑参考": [p_l * 1.06, p_l, p_l * 0.94]
-        }).style.format(precision=2))
+        if rows:
+            mode_label = {
+                'quantile': "分位数回归(10/50/90分位,已按近10日实际波动率自适应)",
+                'linear_fallback': "样本不足或分位数回归失败,已退回简单线性回归+固定区间",
+            }.get(mode, mode)
+            st.caption(f"模型: {mode_label}")
+
+            st.table(pd.DataFrame({
+                "场景": [r[0] for r in rows],
+                "压力参考": [r[1] for r in rows],
+                "支撑参考": [r[2] for r in rows],
+            }).style.format(precision=2))
+
+            iv_ref = estimate_iv_expected_move(ticker, last['Close'])
+            if iv_ref:
+                st.caption(
+                    f"🔮 期权隐含参考(交叉校验): 最近到期日 {iv_ref['nearest_exp']}"
+                    f"(剩{iv_ref['days_to_exp']}天),ATM隐含波动率 {iv_ref['atm_iv']:.1%},"
+                    f"换算1个交易日预期波动约 ±${iv_ref['move_1day']:.2f} "
+                    f"(区间 ${last['Close']-iv_ref['move_1day']:.2f} ~ ${last['Close']+iv_ref['move_1day']:.2f})"
+                )
+            else:
+                st.caption("🔮 期权隐含参考: 暂无法获取(可能被限流,或该标的期权流动性不足)")
+        else:
+            st.info("历史样本不足,暂无法生成场景预测(通常是新股/次新股历史K线太短)")
 
     st.divider()
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
