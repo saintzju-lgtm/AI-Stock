@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 import threading
 import requests
 import pandas_datareader.data as web
+from curl_cffi import requests as cffi_requests  # 👈 利用这个库伪造真实浏览器指纹
 
 # ==========================================
 # 0. 页面全局配置与时区定义
@@ -159,18 +160,58 @@ def do_fetch_stock_data(ticker_symbol):
     except Exception:
         return None
 
+
+# 🎯 核心黑科技：伪造浏览器获取 Crumb 穿透请求期权
+def get_raw_options_with_crumb(ticker_symbol, selected_exp):
+    try:
+        # 使用 curl_cffi 模拟真实 Chrome 浏览器，规避 AWS IP 的 TLS 封锁
+        session = cffi_requests.Session(impersonate="chrome110")
+        
+        # 1. 访问主页种下 Cookie
+        session.get("https://fc.yahoo.com", timeout=5)
+        
+        # 2. 提取动态 Crumb 令牌
+        crumb = session.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=5).text.strip()
+        
+        # 3. 将到期日转换为 Unix 时间戳
+        exp_ts = int(datetime.strptime(selected_exp, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp())
+        
+        # 4. 携带 Cookie + Crumb 请求官方 V7 接口
+        url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker_symbol}?date={exp_ts}&crumb={crumb}"
+        res = session.get(url, timeout=5)
+        
+        if res.status_code == 200:
+            data = res.json()
+            options = data['optionChain']['result'][0].get('options', [{}])[0]
+            
+            calls = pd.DataFrame(options.get('calls', []))
+            puts = pd.DataFrame(options.get('puts', []))
+            return calls, puts
+    except Exception:
+        pass
+    
+    return pd.DataFrame(), pd.DataFrame()
+
+
 def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
-    """严谨量化计算期权指标（带合理约束与防脏数据过滤）"""
     calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
     call_wall, put_wall, gamma_flip, pcr_value = np.nan, np.nan, np.nan, np.nan
     has_valid_oi = False
 
     try:
-        tk_opt = yf.Ticker(ticker_symbol)
-        opt_data = tk_opt.option_chain(selected_exp)
-        calls, puts = opt_data.calls, opt_data.puts
+        # 👉 替换点：不再依赖易被清零的 yfinance，直接用我们写的底层穿透函数抓取
+        calls, puts = get_raw_options_with_crumb(ticker_symbol, selected_exp)
 
-        # 数据预清洗：限定在现价合理区间（0.4倍 ~ 2.2倍）
+        # 确保列存在且填充默认值
+        for df in [calls, puts]:
+            if not df.empty:
+                if 'openInterest' not in df.columns: df['openInterest'] = 0
+                else: df['openInterest'] = df['openInterest'].fillna(0)
+                if 'volume' not in df.columns: df['volume'] = 0
+                else: df['volume'] = df['volume'].fillna(0)
+                if 'impliedVolatility' not in df.columns: df['impliedVolatility'] = 0.2
+                else: df['impliedVolatility'] = df['impliedVolatility'].fillna(0.2)
+
         if not calls.empty:
             calls = calls[(calls['strike'] >= current_price * 0.4) & (calls['strike'] <= current_price * 2.2)].copy()
             if 'openInterest' in calls.columns and calls['openInterest'].sum() > 0:
@@ -180,26 +221,20 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
             if 'openInterest' in puts.columns and puts['openInterest'].sum() > 0:
                 has_valid_oi = True
 
-        # --------------------------------------------------------
-        # 情况 1：如果有真实的 openInterest 持仓量，按标准金融逻辑计算
-        # --------------------------------------------------------
         if has_valid_oi:
             tot_calls_oi = calls['openInterest'].sum() if not calls.empty else 0
             tot_puts_oi = puts['openInterest'].sum() if not puts.empty else 0
             if tot_calls_oi > 0:
                 pcr_value = tot_puts_oi / tot_calls_oi
 
-            # 看涨墙：在现价及上方的行权价中寻找持仓量最大的点
             valid_calls = calls[calls['openInterest'] > 0]
             if not valid_calls.empty:
                 call_wall = valid_calls.loc[valid_calls['openInterest'].idxmax()]['strike']
 
-            # 看跌墙：在现价及下方的行权价中寻找持仓量最大的点
             valid_puts = puts[puts['openInterest'] > 0]
             if not valid_puts.empty:
                 put_wall = valid_puts.loc[valid_puts['openInterest'].idxmax()]['strike']
 
-            # 伽马翻转点计算
             try:
                 exp_date = datetime.strptime(selected_exp, '%Y-%m-%d')
                 T = max((exp_date - datetime.now()).days, 1) / 365.0
@@ -229,14 +264,10 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
                     gamma_flip = x1 - y1 * (x2 - x1) / (y2 - y1) if (y2 - y1) != 0 else x1
             except Exception: pass
 
-        # --------------------------------------------------------
-        # 严格金融逻辑校验（绝不产生支撑 > 压力的倒挂）
-        # --------------------------------------------------------
         if pd.notnull(call_wall) and pd.notnull(put_wall):
-            if put_wall > call_wall: # 若出现支撑位大于压力位的异常，清空无用指标
+            if put_wall > call_wall: 
                 put_wall, call_wall, gamma_flip = np.nan, np.nan, np.nan
 
-        # 切片用于表格渲染
         for df_type, target_df in [('calls', calls), ('puts', puts)]:
             if not target_df.empty:
                 idx = (target_df['strike'] - current_price).abs().idxmin()
@@ -427,7 +458,6 @@ else:
             if opt_data:
                 calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_val, has_valid_oi = opt_data
                 
-                # 如果持仓量数据被云端抹除（全 0），给出友情提示
                 if not has_valid_oi:
                     st.warning("⚠️ 提示：数据源当前删减了该到期日的持仓量 (OI=0)。为防止错误的做市商指标误导决策，已暂停“墙”与 Gamma 指标计算。")
 
