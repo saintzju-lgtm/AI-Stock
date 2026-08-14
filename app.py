@@ -19,16 +19,6 @@ st.set_page_config(layout="wide", page_title="专业量化决策终端")
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-PRESET_FLOATS = {
-    "BTDR": 123715025,
-    "AAPL": 15200000000,
-    "TSLA": 3180000000,
-    "NVDA": 24500000000,
-    "MSFT": 7430000000,
-    "GOOG": 12300000000,
-    "QQQ": 600000000
-}
-
 # ==========================================
 # 🧠 1. 全局解耦内存存储中心
 # ==========================================
@@ -67,7 +57,71 @@ def load_us_stock_library():
 STOCK_LIBRARY = load_us_stock_library()
 
 # ==========================================
-# 🚀 3. 抗崩溃数据抓取引擎 & 动态回归模型
+# 🧮 3. 动态股本解析与换手率计算引擎
+# ==========================================
+def resolve_dynamic_share_capital(info, ticker_symbol):
+    """
+    动态解析自由流通股 (Free Float) 与 总股本 (Shares Outstanding)
+    带防拆股未同步/增发数据校正逻辑
+    """
+    float_shares = info.get('floatShares') if info else None
+    shares_out = info.get('sharesOutstanding') if info else None
+    
+    # 转为数值
+    float_shares = float(float_shares) if float_shares and float_shares > 0 else None
+    shares_out = float(shares_out) if shares_out and shares_out > 0 else None
+    
+    # 拆股/数据错配校正：若自由流通股 > 总股本，说明 API 拆股系数未调整，强制修正
+    if float_shares and shares_out and float_shares > shares_out * 1.05:
+        float_shares = shares_out * 0.85 # 按常见自由流通比例回退
+        
+    if float_shares:
+        capital = float_shares
+        cap_type = "自由流通股 (Free Float)"
+    elif shares_out:
+        capital = shares_out
+        cap_type = "总股本 (Shares Outstanding)"
+    else:
+        capital = None
+        cap_type = "未知股本"
+        
+    return capital, cap_type, float_shares, shares_out
+
+def calculate_turnover_metrics(volume, capital, timestamp_unix):
+    """
+    计算实时换手率 & 盘中外推预计全天换手率 (美东 09:30 - 16:00，共390分钟)
+    """
+    if not capital or capital <= 0 or not volume or volume <= 0:
+        return 0.0, 0.0, "数据不足"
+        
+    realtime_turnover = (volume / capital) * 100.0
+    
+    # 转美东时间 (EDT / EST) 判断盘中进度
+    dt_utc = datetime.fromtimestamp(timestamp_unix, tz=timezone.utc)
+    dt_est = dt_utc.astimezone(timezone(timedelta(hours=-4))) # 美东夏令时 EDT
+    
+    weekday = dt_est.weekday()
+    time_min = dt_est.hour * 60 + dt_est.minute
+    open_min = 9 * 60 + 30   # 09:30
+    close_min = 16 * 60      # 16:00
+    total_trade_min = 390    # 6.5 小时
+    
+    if weekday < 5 and open_min <= time_min <= close_min:
+        elapsed = max(time_min - open_min, 1)
+        projected_vol = volume * (total_trade_min / elapsed)
+        projected_turnover = (projected_vol / capital) * 100.0
+        status_str = f"盘中外推 (已交易 {elapsed} 分钟)"
+    elif weekday < 5 and time_min < open_min:
+        projected_turnover = realtime_turnover
+        status_str = "未开盘 (盘前)"
+    else:
+        projected_turnover = realtime_turnover
+        status_str = "已收盘/盘后"
+        
+    return realtime_turnover, projected_turnover, status_str
+
+# ==========================================
+# 🚀 4. 抗崩溃数据抓取引擎
 # ==========================================
 def fetch_macro_api(symbol, stooq_symbol):
     try:
@@ -123,7 +177,8 @@ def do_fetch_stock_data(ticker_symbol):
             try: exp_dates = list(yf.Ticker(ticker_symbol).options)
             except Exception: exp_dates = []
 
-        current_float = PRESET_FLOATS.get(ticker_symbol, info.get('floatShares') or info.get('sharesOutstanding'))
+        # 🎯 动态解算真实流通股本与总股本
+        capital, cap_type, float_shares, shares_out = resolve_dynamic_share_capital(info, ticker_symbol)
 
         hist.index = pd.to_datetime(hist.index).date
         hist['昨收'] = hist['Close'].shift(1)
@@ -131,7 +186,12 @@ def do_fetch_stock_data(ticker_symbol):
         hist['MA20'] = hist['Close'].rolling(20).mean()
         std20 = hist['Close'].rolling(20).std()
         hist['Upper'], hist['Lower'] = hist['MA20'] + std20*2, hist['MA20'] - std20*2
-        hist['换手率_raw'] = (hist['Volume'] / current_float) if (current_float and current_float > 0) else np.nan
+        
+        # 历史 K 线换手率序列计算
+        if capital and capital > 0:
+            hist['换手率_raw'] = (hist['Volume'] / capital)
+        else:
+            hist['换手率_raw'] = np.nan
         
         tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
         rmf = tp * hist['Volume']
@@ -142,7 +202,7 @@ def do_fetch_stock_data(ticker_symbol):
         dark = hist[hist['Volume'] > avg_vol * 1.2].tail(8).copy()
         dark['Signal'] = dark.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
 
-        # 波动率自适应 + 残差分位数拟合引擎
+        # 波动率自适应 + 残差分位数拟合
         fit_df = hist.dropna().copy()
         X = ((fit_df['Open'] - fit_df['昨收']) / fit_df['昨收']).values.reshape(-1, 1)
         reg_params = {}
@@ -157,7 +217,6 @@ def do_fetch_stock_data(ticker_symbol):
             m = LinearRegression().fit(X, y_real)
             y_pred = m.predict(X)
             residuals = y_real - y_pred
-            
             q10, q50, q90 = np.percentile(residuals, [10, 50, 90])
             
             reg_params[f's_{tag}'] = float(m.coef_[0])
@@ -168,10 +227,15 @@ def do_fetch_stock_data(ticker_symbol):
             
         reg_params['vol_scale'] = vol_scale
 
+        latest_vol = hist['Volume'].iloc[-1]
+        rt_turnover, proj_turnover, trade_status = calculate_turnover_metrics(latest_vol, capital, now_ts)
+
         return hist, reg_params, dark, exp_dates, {
             'btc': btc, 'nasdaq': nasdaq, 'nasdaq_pct': nasdaq_pct, 
-            'vix': vix, 'vix_pct': vix_pct, 'float': current_float, 
-            'volume': hist['Volume'].iloc[-1], 'source': source,
+            'vix': vix, 'vix_pct': vix_pct, 
+            'capital': capital, 'cap_type': cap_type,
+            'rt_turnover': rt_turnover, 'proj_turnover': proj_turnover, 'trade_status': trade_status,
+            'volume': latest_vol, 'source': source,
             'fetch_time': fetch_time_bj,
             'timestamp': now_ts 
         }
@@ -220,7 +284,6 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
                 df['impliedVolatility'] = df['impliedVolatility'].apply(lambda x: x if x > 0.01 else 0.25)
                 df['density_weight'] = 1.0 / (1.0 + (df['strike'] - current_price).abs())
 
-        # ATM IV & Expected Move 计算
         all_options = pd.concat([calls, puts], ignore_index=True)
         if not all_options.empty:
             atm_row = all_options.iloc[(all_options['strike'] - current_price).abs().idxmin()]
@@ -231,7 +294,6 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
                 days_to_exp = max((exp_date - datetime.now()).days, 1)
                 move_exp = current_price * atm_iv * np.sqrt(days_to_exp / 365.0)
 
-        # 过滤离谱价格
         if not calls.empty:
             calls = calls[(calls['strike'] >= current_price * 0.2) & (calls['strike'] <= current_price * 3.0)].copy()
         if not puts.empty:
@@ -268,7 +330,6 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
         if pd.isna(call_wall) and not calls.empty: call_wall = float(calls['strike'].max())
         if pd.isna(put_wall) and not puts.empty: put_wall = float(puts['strike'].min())
 
-        # Gamma Flip
         try:
             exp_date = datetime.strptime(selected_exp, '%Y-%m-%d')
             T = max((exp_date - datetime.now()).days, 1) / 365.0
@@ -315,11 +376,10 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
     except Exception:
         calc_mode = "行权价分布"
 
-    # 🛠️ 修复点：将 pcr_val 修正为 pcr_value，解决 NameError
     return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_value, calc_mode, atm_iv, move_1d, move_exp
 
 # ==========================================
-# 🔄 4. 永不崩溃的后台守护线程
+# 🔄 5. 永不崩溃的后台守护线程
 # ==========================================
 def background_updater_loop():
     while True:
@@ -364,7 +424,7 @@ def start_background_engine():
 start_background_engine()
 
 # ==========================================
-# 🖥️ 5. 纯前端 UI 渲染层
+# 🖥️ 6. 纯前端 UI 渲染层
 # ==========================================
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; } </style>""", unsafe_allow_html=True)
 
@@ -427,21 +487,30 @@ else:
 
     st.divider()
     
-    # 场景回归预测 (整合 A:波动率自适应 + B:分位数残差)
+    # -------------------------------------------------------------
+    # 📊 换手率与场景回归看板 (动态外推与基准股本透明化)
+    # -------------------------------------------------------------
     c1, c2 = st.columns([1, 1.5])
     with c1:
         st.subheader("📊 实时指标")
-        if mkt['float'] and mkt['float'] > 0:
-            turnover_rate = (mkt['volume']/mkt['float'])*100
-            st.write(f"实时换手: **{turnover_rate:.2f}%**")
+        
+        # 🎯 升级后的换手率展示
+        if mkt['capital'] and mkt['capital'] > 0:
+            cap_m = mkt['capital'] / 1e8 if mkt['capital'] >= 1e8 else mkt['capital'] / 1e4
+            unit_str = "亿股" if mkt['capital'] >= 1e8 else "万股"
+            
+            st.write(f"实时已换手: **{mkt['rt_turnover']:.2f}%**")
+            st.write(f"预估全天换手: **{mkt['proj_turnover']:.2f}%** (`{mkt['trade_status']}`)")
+            st.write(f"基准股本: **{cap_m:.2f} {unit_str}** (`{mkt['cap_type']}`)")
         else:
-            st.write("实时换手: **N/A (无股本数据)**")
+            st.write("实时换手: **N/A (无法解析有效股本)**")
+            
         st.write(f"BOLL 高/低: **{last['Upper']:.2f} / {last['Lower']:.2f}**")
         st.write(f"资金 MFI: **{last['MFI']:.2f}**")
         st.write(f"波动自适应因子: **{reg.get('vol_scale', 1.0):.2f}x**")
 
     with c2:
-        st.subheader("📍 场景回归预测 (分位数自适应)")
+        st.subheader("📍 场景回归预测 (残差分位数)")
         ratio_o = (last['Open'] - last['昨收']) / last['昨收'] if last['昨收'] > 0 else 0
         v_scale = reg.get('vol_scale', 1.0)
         
