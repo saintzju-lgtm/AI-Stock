@@ -95,7 +95,6 @@ def load_us_stock_library():
 
 STOCK_LIBRARY = load_us_stock_library()
 
-# 精确股本字典 (单位：股)
 PRESET_FLOATS = {
     "BTDR": 123715025,
     "AAPL": 15200000000,
@@ -107,10 +106,9 @@ PRESET_FLOATS = {
 }
 
 # ==========================================
-# 🚀 3. 极速 API 抓取引擎
+# 🚀 3. API 抓取引擎 & 深度期权分析
 # ==========================================
 def fetch_yahoo_chart_api(symbol):
-    """利用 Yahoo 官方前端 Chart v8 API 获取实时价格与涨跌幅 (防封锁)"""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
         headers = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)'}
@@ -131,7 +129,6 @@ def get_enhanced_market_data(ticker_symbol):
         hist = pd.DataFrame()
         info = {}
         
-        # --- 1. 获取核心 K 线数据 ---
         try:
             tk = yf.Ticker(ticker_symbol)
             hist = tk.history(period="100d", interval="1d")
@@ -140,7 +137,6 @@ def get_enhanced_market_data(ticker_symbol):
         except Exception:
             hist = pd.DataFrame()
 
-        # 兜底 Stooq 源
         if hist.empty:
             try:
                 stooq_code = f"{ticker_symbol}.US" if "^" not in ticker_symbol and "." not in ticker_symbol else ticker_symbol
@@ -152,40 +148,18 @@ def get_enhanced_market_data(ticker_symbol):
         if hist.empty:
             return "所有数据源访问均失败，请稍后再试。"
 
-        # --- 2. 抓取顶部宏观指标 ---
         btc, _ = fetch_yahoo_chart_api("BTC-USD")
         nasdaq, nasdaq_pct = fetch_yahoo_chart_api("^IXIC")
         vix, vix_pct = fetch_yahoo_chart_api("^VIX")
 
-        # --- 3. 期权数据抓取 ---
-        calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
-        current_exp, pcr_value = "N/A", "N/A"
+        # 获取可用到期日列表
+        exp_dates = []
         try:
             tk_opt = yf.Ticker(ticker_symbol)
-            exp_dates = tk_opt.options
-            if exp_dates:
-                today_str = datetime.now().strftime('%Y-%m-%d')
-                current_exp = exp_dates[1] if (exp_dates[0] <= today_str and len(exp_dates) > 1) else exp_dates[0]
-                opt_data = tk_opt.option_chain(current_exp)
-                curr_p = hist['Close'].iloc[-1]
-                
-                try:
-                    total_calls = opt_data.calls['openInterest'].sum()
-                    total_puts = opt_data.puts['openInterest'].sum()
-                    if total_calls > 0: pcr_value = total_puts / total_calls
-                except: pass
-
-                for df_type in ['calls', 'puts']:
-                    df = getattr(opt_data, df_type)
-                    if not df.empty:
-                        idx = (df['strike'] - curr_p).abs().idxmin()
-                        slice_df = df.iloc[max(0, idx-4) : min(len(df), idx+5)]
-                        if df_type == 'calls': calls_df = slice_df
-                        else: puts_df = slice_df
+            exp_dates = list(tk_opt.options)
         except Exception:
-            pass
+            exp_dates = []
 
-        # --- 4. 精准流通股本与换手率计算 ---
         current_float = None
         if ticker_symbol in PRESET_FLOATS:
             current_float = PRESET_FLOATS[ticker_symbol]
@@ -199,24 +173,20 @@ def get_enhanced_market_data(ticker_symbol):
         std20 = hist['Close'].rolling(20).std()
         hist['Upper'], hist['Lower'] = hist['MA20'] + std20*2, hist['MA20'] - std20*2
         
-        # 换手率计算
         if current_float and current_float > 0:
             hist['换手率_raw'] = (hist['Volume'] / current_float)
         else:
             hist['换手率_raw'] = np.nan
         
-        # MFI 资金流
         tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
         rmf = tp * hist['Volume']
         mfr = pd.Series(np.where(tp > tp.shift(1), rmf, 0)).rolling(14).sum() / pd.Series(np.where(tp < tp.shift(1), rmf, 0)).rolling(14).sum()
         hist['MFI'] = 100 - (100 / (1 + mfr.values))
 
-        # 暗池/大宗信号
         avg_vol = hist['Volume'].mean()
         dark = hist[hist['Volume'] > avg_vol * 1.2].tail(8).copy()
         dark['Signal'] = dark.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
 
-        # 线性回归预测
         fit_df = hist.dropna()
         X = ((fit_df['Open'] - fit_df['昨收']) / fit_df['昨收']).values.reshape(-1, 1)
         reg_params = {}
@@ -224,14 +194,96 @@ def get_enhanced_market_data(ticker_symbol):
             m = LinearRegression().fit(X, fit_df[target].values / fit_df['昨收'].values - 1)
             reg_params[f's_{tag}'], reg_params[f'i_{tag}'] = m.coef_[0], m.intercept_
 
-        return hist, reg_params, calls_df, puts_df, dark, {
+        return hist, reg_params, dark, exp_dates, {
             'btc': btc, 'nasdaq': nasdaq, 'nasdaq_pct': nasdaq_pct, 
             'vix': vix, 'vix_pct': vix_pct, 'float': current_float, 
-            'volume': hist['Volume'].iloc[-1] if not hist.empty else 0, 
-            'exp': current_exp, 'pcr': pcr_value
+            'volume': hist['Volume'].iloc[-1] if not hist.empty else 0
         }
     except Exception as e:
         return f"系统核心异常: {str(e)}"
+
+# -------------------------------------------------------------
+# 🎯 选定到期日的期权链及看涨墙/看跌墙/伽马翻转点计算
+# -------------------------------------------------------------
+@st.cache_data(ttl=300)
+def get_option_chain_details(ticker_symbol, selected_exp, current_price):
+    calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
+    call_wall, put_wall, gamma_flip, pcr_value = np.nan, np.nan, np.nan, np.nan
+    
+    try:
+        tk_opt = yf.Ticker(ticker_symbol)
+        opt_data = tk_opt.option_chain(selected_exp)
+        calls = opt_data.calls
+        puts = opt_data.puts
+
+        # 1. PCR 计算
+        total_calls_oi = calls['openInterest'].sum() if not calls.empty else 0
+        total_puts_oi = puts['openInterest'].sum() if not puts.empty else 0
+        if total_calls_oi > 0:
+            pcr_value = total_puts_oi / total_calls_oi
+
+        # 2. 看涨墙 (Call Wall) 与 看跌墙 (Put Wall)
+        if not calls.empty and calls['openInterest'].max() > 0:
+            call_wall = calls.loc[calls['openInterest'].idxmax()]['strike']
+        if not puts.empty and puts['openInterest'].max() > 0:
+            put_wall = puts.loc[puts['openInterest'].idxmax()]['strike']
+
+        # 3. 伽马翻转点 (Gamma Flip Point) 数值建模计算
+        try:
+            exp_date = datetime.strptime(selected_exp, '%Y-%m-%d')
+            days = (exp_date - datetime.now()).days
+            T = max(days, 1) / 365.0
+            
+            # 建立标的资产价格扫描区间 (0.6 * Spot 至 1.4 * Spot)
+            s_range = np.linspace(current_price * 0.6, current_price * 1.4, 150)
+            net_gammas = []
+
+            for s_test in s_range:
+                tot_g = 0.0
+                # Calls (Positive Gamma)
+                for _, row in calls.iterrows():
+                    k, oi, iv = row['strike'], row['openInterest'], row.get('impliedVolatility', 0.2)
+                    if oi > 0 and k > 0 and iv > 0.01:
+                        d1 = (np.log(s_test / k) + 0.5 * (iv**2) * T) / (iv * np.sqrt(T))
+                        gamma = np.exp(-0.5 * d1**2) / (s_test * iv * np.sqrt(2 * np.pi * T))
+                        tot_g += oi * gamma
+                # Puts (Negative Gamma)
+                for _, row in puts.iterrows():
+                    k, oi, iv = row['strike'], row['openInterest'], row.get('impliedVolatility', 0.2)
+                    if oi > 0 and k > 0 and iv > 0.01:
+                        d1 = (np.log(s_test / k) + 0.5 * (iv**2) * T) / (iv * np.sqrt(T))
+                        gamma = np.exp(-0.5 * d1**2) / (s_test * iv * np.sqrt(2 * np.pi * T))
+                        tot_g -= oi * gamma
+                net_gammas.append(tot_g)
+
+            # 寻找零点交叉位置 (Gamma Flip)
+            net_gammas = np.array(net_gammas)
+            zero_crossings = np.where(np.diff(np.sign(net_gammas)))[0]
+            if len(zero_crossings) > 0:
+                idx = zero_crossings[0]
+                y1, y2 = net_gammas[idx], net_gammas[idx+1]
+                x1, x2 = s_range[idx], s_range[idx+1]
+                gamma_flip = x1 - y1 * (x2 - x1) / (y2 - y1) if (y2 - y1) != 0 else x1
+            else:
+                # 兜底算法：OI 加权 strike
+                tot_oi = total_calls_oi + total_puts_oi
+                if tot_oi > 0:
+                    gamma_flip = ((calls['strike']*calls['openInterest']).sum() + (puts['strike']*puts['openInterest']).sum()) / tot_oi
+        except Exception:
+            pass
+
+        # 4. ATM 中心化切片用于表格展示
+        for df_type, target_df in [('calls', calls), ('puts', puts)]:
+            if not target_df.empty:
+                idx = (target_df['strike'] - current_price).abs().idxmin()
+                slice_df = target_df.iloc[max(0, idx-4) : min(len(target_df), idx+5)]
+                if df_type == 'calls': calls_df = slice_df
+                else: puts_df = slice_df
+
+    except Exception:
+        pass
+
+    return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_value
 
 # ==========================================
 # 🖥️ 4. 终端 UI 渲染层
@@ -269,7 +321,7 @@ data = get_enhanced_market_data(ticker)
 if isinstance(data, str):
     st.error(f"⚠️ {data}")
 elif data:
-    hist_df, reg, calls_df, puts_df, dark_df, mkt = data
+    hist_df, reg, dark_df, exp_dates, mkt = data
     last = hist_df.iloc[-1]
     
     # 全球宏观看板
@@ -298,7 +350,6 @@ elif data:
         p_h = last['昨收'] * (1 + (reg['i_h'] + reg['s_h'] * ratio_o))
         p_l = last['昨收'] * (1 + (reg['i_l'] + reg['s_l'] * ratio_o))
         
-        # 👉 已替换场景名称为：乐观、中性、悲观
         st.table(pd.DataFrame({
             "场景": ["乐观", "中性", "悲观"], 
             "压力参考": [p_h*1.06, p_h, p_h*0.94], 
@@ -327,24 +378,47 @@ elif data:
     fig.update_xaxes(type='category', tickmode='linear', dtick=1, tickangle=-90)
     st.plotly_chart(fig, use_container_width=True)
 
-    # 期权与大宗交易
+    # --- 期权与大宗交易模块 ---
     st.divider()
-    o_col, d_col = st.columns(2)
+    o_col, d_col = st.columns([1.6, 1])
+    
     with o_col:
-        pcr_display = f" | PCR: {mkt['pcr']:.2f}" if isinstance(mkt.get('pcr'), (float, int)) else ""
-        st.subheader(f"🕯️ 全景期权 (到期:{mkt['exp']}{pcr_display})")
-        t1, t2 = st.tabs(["📈 看涨 (Calls)", "📉 看跌 (Puts)"])
+        st.subheader("🕯️ 全景期权决策分析")
         
-        with t1: 
-            if not calls_df.empty: 
-                st.dataframe(calls_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
-            else: 
-                st.info("期权接口受云端限流保护，暂不显示")
-        with t2: 
-            if not puts_df.empty: 
-                st.dataframe(puts_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
-            else: 
-                st.info("期权接口受云端限流保护，暂不显示")
+        if exp_dates:
+            # 默认勾选离今天最近的下一个期权到期日
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            default_exp_idx = 0
+            for idx, ed in enumerate(exp_dates):
+                if ed >= today_str:
+                    default_exp_idx = idx
+                    break
+            
+            selected_exp = st.selectbox("📅 选择期权到期日", options=exp_dates, index=default_exp_idx)
+            
+            # 获取指定到期日的期权指标
+            calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_val = get_option_chain_details(ticker, selected_exp, last['Close'])
+            
+            # 顶部 4 关键指标卡片展示
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("🧱 看涨墙 (Call Wall)", f"${call_wall:.2f}" if pd.notnull(call_wall) else "N/A")
+            q2.metric("🧱 看跌墙 (Put Wall)", f"${put_wall:.2f}" if pd.notnull(put_wall) else "N/A")
+            q3.metric("🌀 伽马翻转点", f"${gamma_flip:.2f}" if pd.notnull(gamma_flip) else "N/A")
+            q4.metric("📊 Put/Call Ratio", f"{pcr_val:.2f}" if pd.notnull(pcr_val) else "N/A")
+
+            t1, t2 = st.tabs(["📈 看涨 (Calls)", "📉 看跌 (Puts)"])
+            with t1: 
+                if not calls_df.empty: 
+                    st.dataframe(calls_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
+                else: 
+                    st.info("该到期日暂无看涨期权数据或受到接口频控")
+            with t2: 
+                if not puts_df.empty: 
+                    st.dataframe(puts_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
+                else: 
+                    st.info("该到期日暂无看跌期权数据或受到接口频控")
+        else:
+            st.info("该股票暂无期权链数据")
             
     with d_col:
         st.subheader("🌑 大宗异动打印 (Dark Pool)")
