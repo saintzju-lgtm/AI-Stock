@@ -32,11 +32,10 @@ PRESET_FLOATS = {
 # ==========================================
 @st.cache_resource
 def get_global_data_store():
-    """全局共享内存：前端页面无论怎么刷新、点哪个期权到期日，都只读内存"""
     return {
         "stock_cache": {},        # 结构: { "BTDR": (hist, reg, dark, exp_dates, mkt) }
         "options_cache": {},      # 结构: { "BTDR_2026-08-21": (calls, puts, wall_c, wall_p, flip, pcr) }
-        "active_queue": set(["BTDR", "AAPL", "TSLA", "NVDA"]), # 后台轮询股票队列
+        "active_queue": set(["BTDR", "AAPL", "TSLA", "NVDA"]), 
         "last_updated": 0,
         "lock": threading.Lock()
     }
@@ -66,12 +65,12 @@ def load_us_stock_library():
 STOCK_LIBRARY = load_us_stock_library()
 
 # ==========================================
-# 🚀 3. 后台独立抓取引擎 (仅供线程调用)
+# 🚀 3. 抗崩溃数据抓取引擎
 # ==========================================
 def fetch_macro_api(symbol, stooq_symbol):
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
             meta = res.json()['chart']['result'][0]['meta']
             price = meta.get('regularMarketPrice', 0.0)
@@ -88,7 +87,7 @@ def fetch_macro_api(symbol, stooq_symbol):
     return 0.0, 0.0
 
 def do_fetch_stock_data(ticker_symbol):
-    """后台抓取股票与核心指标"""
+    """抓取股票与核心指标（带全重兜底保护）"""
     try:
         hist = pd.DataFrame()
         info = {}
@@ -98,7 +97,7 @@ def do_fetch_stock_data(ticker_symbol):
             tk = yf.Ticker(ticker_symbol)
             hist = tk.history(period="100d", interval="1d")
             try: info = tk.info
-            except: info = {}
+            except Exception: info = {}
         except Exception:
             hist = pd.DataFrame()
 
@@ -155,7 +154,7 @@ def do_fetch_stock_data(ticker_symbol):
         return None
 
 def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
-    """后台计算期权指标（看涨/看跌墙、伽马翻转点、PCR）"""
+    """计算期权指标"""
     calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
     call_wall, put_wall, gamma_flip, pcr_value = np.nan, np.nan, np.nan, np.nan
     try:
@@ -216,41 +215,46 @@ def do_fetch_option_details(ticker_symbol, selected_exp, current_price):
     return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_value
 
 # ==========================================
-# 🔄 4. 异步全量守护线程 (全量预载期权)
+# 🔄 4. 永不崩溃的后台守护线程
 # ==========================================
 def background_updater_loop():
-    """守护线程：不仅处理股票K线，还自动预载近期的期权链，实现完全无感调用"""
+    """后台独立轮询：全量 try-except 保护，即使报错也绝不会死锁掉线"""
     while True:
-        with GLOBAL_STORE["lock"]:
-            tickers_to_process = list(GLOBAL_STORE["active_queue"])
-        
-        for ticker in tickers_to_process:
-            # 1. 抓取股票核心数据
-            data = do_fetch_stock_data(ticker)
-            if data:
-                with GLOBAL_STORE["lock"]:
-                    GLOBAL_STORE["stock_cache"][ticker] = data
-                
-                hist_df, _, _, exp_dates, _ = data
-                last_price = hist_df['Close'].iloc[-1]
-                
-                # 2. 【核心升级】：后台自动预抓取前 4 个到期日的期权链数据（覆盖绝大多数交易场景）
-                today_str = datetime.now().strftime('%Y-%m-%d')
-                future_exps = [ed for ed in exp_dates if ed >= today_str][:4]
-                
-                for exp_date in future_exps:
-                    opt_key = f"{ticker}_{exp_date}"
-                    opt_data = do_fetch_option_details(ticker, exp_date, last_price)
-                    with GLOBAL_STORE["lock"]:
-                        GLOBAL_STORE["options_cache"][opt_key] = opt_data
-                    time.sleep(1.2) # 期权链抓取缓冲（极度安全控频）
-
-            time.sleep(2.5) # 股票请求控频缓冲
-        
-        with GLOBAL_STORE["lock"]:
-            GLOBAL_STORE["last_updated"] = time.time()
+        try:
+            with GLOBAL_STORE["lock"]:
+                tickers_to_process = list(GLOBAL_STORE["active_queue"])
             
-        time.sleep(180) # 3 分钟进行下一轮全量更新
+            for ticker in tickers_to_process:
+                try:
+                    # 1. 优先抢抓股票 K 线数据（毫秒级写入，保证页面秒开）
+                    data = do_fetch_stock_data(ticker)
+                    if data:
+                        with GLOBAL_STORE["lock"]:
+                            GLOBAL_STORE["stock_cache"][ticker] = data
+                        
+                        # 2. 抓完 K 线后，后台顺带预抓近 2 个期权到期日
+                        hist_df, _, _, exp_dates, _ = data
+                        last_price = hist_df['Close'].iloc[-1]
+                        today_str = datetime.now().strftime('%Y-%m-%d')
+                        future_exps = [ed for ed in exp_dates if ed >= today_str][:2]
+                        
+                        for exp_date in future_exps:
+                            try:
+                                opt_key = f"{ticker}_{exp_date}"
+                                opt_data = do_fetch_option_details(ticker, exp_date, last_price)
+                                with GLOBAL_STORE["lock"]:
+                                    GLOBAL_STORE["options_cache"][opt_key] = opt_data
+                                time.sleep(1.0)
+                            except Exception: pass
+
+                except Exception: pass
+                time.sleep(2.0) # 请求安全缓冲
+            
+            with GLOBAL_STORE["lock"]:
+                GLOBAL_STORE["last_updated"] = time.time()
+                
+        except Exception: pass
+        time.sleep(180) # 3 分钟一轮循环
 
 @st.cache_resource
 def start_background_engine():
@@ -261,7 +265,7 @@ def start_background_engine():
 start_background_engine()
 
 # ==========================================
-# 🖥️ 5. 纯前端 UI 渲染层 (零外部网络请求)
+# 🖥️ 5. 纯前端 UI 渲染层 (带自动同步兜底)
 # ==========================================
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; } </style>""", unsafe_allow_html=True)
 
@@ -292,18 +296,27 @@ with st.sidebar:
 ticker = st.session_state.current_ticker
 st.title(f"🎯 {ticker} 专业量化决策终端")
 
-# 🔒 【核心解耦点】：前端只读共享内存，绝不上网请求
+# 读取内存缓存
 stock_data = GLOBAL_STORE["stock_cache"].get(ticker)
 
+# 🛠️ 【核心同步兜底】：如果后台线程还没排队到当前股票，主线程强行同步抓取一次并写入内存，彻底杜绝死等！
 if not stock_data:
-    st.info(f"⏳ 后台线程正在为您同步预载 **{ticker}** 股票与期权数据，请等待 3~5 秒后刷新...")
+    with st.spinner(f"🚀 首次加载 {ticker}，正在紧急同步数据..."):
+        stock_data = do_fetch_stock_data(ticker)
+        if stock_data:
+            with GLOBAL_STORE["lock"]:
+                GLOBAL_STORE["stock_cache"][ticker] = stock_data
+                GLOBAL_STORE["active_queue"].add(ticker)
+
+if not stock_data:
+    st.error("⚠️ 当前股票数据拉取失败，可能是股票代码不匹配或数据源暂时中断。")
 else:
     hist_df, reg, dark_df, exp_dates, mkt = stock_data
     last = hist_df.iloc[-1]
     
     # 顶部状态栏
-    updated_str = datetime.fromtimestamp(GLOBAL_STORE["last_updated"]).strftime('%H:%M:%S') if GLOBAL_STORE["last_updated"] > 0 else "初始化中"
-    st.caption(f"🟢 全量解耦隔离中 | 本地缓存更新于: **{updated_str}** | 当前数据源: **{mkt['source']}**")
+    updated_str = datetime.fromtimestamp(GLOBAL_STORE["last_updated"]).strftime('%H:%M:%S') if GLOBAL_STORE["last_updated"] > 0 else "实时"
+    st.caption(f"🟢 数据解耦防护中 | 内存缓存更新于: **{updated_str}** | 数据源: **{mkt['source']}**")
     
     # 全球宏观看板
     m1, m2, m3, m4 = st.columns(4)
@@ -376,10 +389,15 @@ else:
             
             selected_exp = st.selectbox("📅 选择期权到期日", options=exp_dates, index=default_exp_idx)
             
-            # 🔒 【核心提升】：直接从后台预载的 options_cache 提取，完全不需要发起网络请求
+            # 期权数据读取（内存无则同步触发一次补存）
             opt_key = f"{ticker}_{selected_exp}"
             opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
-            
+            if not opt_data:
+                opt_data = do_fetch_option_details(ticker, selected_exp, last['Close'])
+                if opt_data:
+                    with GLOBAL_STORE["lock"]:
+                        GLOBAL_STORE["options_cache"][opt_key] = opt_data
+
             if opt_data:
                 calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_val = opt_data
                 
@@ -400,8 +418,6 @@ else:
                         st.dataframe(puts_df[['strike','lastPrice','openInterest','impliedVolatility']].style.format({'impliedVolatility': '{:.2%}', 'lastPrice': '{:.2f}', 'strike': '{:.2f}', 'openInterest': '{:,.0f}'}), use_container_width=True)
                     else: 
                         st.info("该到期日暂无看跌期权数据")
-            else:
-                st.info("⏳ 后台正在排队预载该远期期权数据，请片刻后刷新...")
         else:
             st.info("💡 当前为 Stooq 备用源模式或该股票暂无期权链交易。")
             
