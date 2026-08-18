@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone, timedelta
 import threading
 import requests
-import pandas_datareader.data as web
+from io import StringIO
 from curl_cffi import requests as cffi_requests
 
 # ==========================================
@@ -57,7 +57,7 @@ def load_us_stock_library():
     ]
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=5)
+        res = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=4)
         data = res.json()
         us_stocks = [f"{item['ticker']} - {item['title'].title()}" for item in data.values()]
         return custom_library + [s for s in us_stocks if s.split(" - ")[0] not in [c.split(" - ")[0] for c in custom_library]]
@@ -124,40 +124,60 @@ def calculate_turnover_metrics(volume, capital, timestamp_unix):
     return realtime_turnover, projected_turnover, status_str
 
 # ==========================================
-# 🚀 4. TLS 指纹伪造网络抓取引擎 (curl_cffi)
+# 🚀 4. 四级多源抗封锁抓取引擎
 # ==========================================
-def fetch_chart_via_cffi(symbol):
-    """使用 Chrome 110 TLS 指纹抓取 Yahoo Chart 100日 K线数据"""
+def fetch_chart_yahoo_direct(symbol):
+    """源1：Yahoo Chart 官方原生 API 直连"""
+    for domain in ["query2.finance.yahoo.com", "query1.finance.yahoo.com"]:
+        try:
+            url = f"https://{domain}/v8/finance/chart/{symbol}?range=120d&interval=1d&includePrePost=false"
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+            res = requests.get(url, headers=headers, timeout=3)
+            if res.status_code == 200:
+                result = res.json()['chart']['result'][0]
+                timestamps = result.get('timestamp', [])
+                quote = result['indicators']['quote'][0]
+                
+                df = pd.DataFrame({
+                    'Open': quote.get('open', []),
+                    'High': quote.get('high', []),
+                    'Low': quote.get('low', []),
+                    'Close': quote.get('close', []),
+                    'Volume': quote.get('volume', [])
+                }, index=pd.to_datetime(timestamps, unit='s'))
+                
+                df = df.dropna(subset=['Close']).copy()
+                if len(df) >= 2:
+                    return df, "Yahoo Direct API"
+        except Exception:
+            pass
+    return pd.DataFrame(), ""
+
+def fetch_chart_stooq_csv(symbol):
+    """源2：Stooq 官方 CSV 物理通道 (100% 不会被封)"""
     try:
-        session = cffi_requests.Session(impersonate="chrome110")
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range=120d&interval=1d&includePrePost=false"
-        res = session.get(url, timeout=6)
-        if res.status_code == 200:
-            result = res.json()['chart']['result'][0]
-            timestamps = result.get('timestamp', [])
-            quote = result['indicators']['quote'][0]
-            
-            df = pd.DataFrame({
-                'Open': quote.get('open', []),
-                'High': quote.get('high', []),
-                'Low': quote.get('low', []),
-                'Close': quote.get('close', []),
-                'Volume': quote.get('volume', [])
-            }, index=pd.to_datetime(timestamps, unit='s'))
-            
+        clean_sym = symbol.lower().split('.')[0].replace('^', '')
+        stooq_sym = f"{clean_sym}.us" if not symbol.startswith('^') and '-USD' not in symbol else clean_sym
+        url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=4)
+        if res.status_code == 200 and "Date" in res.text:
+            df = pd.read_csv(StringIO(res.text))
+            df.columns = [c.capitalize() for c in df.columns]
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date').sort_index()
             df = df.dropna(subset=['Close']).copy()
-            if not df.empty:
-                return df
+            if len(df) >= 2:
+                return df, "Stooq CSV 直连"
     except Exception:
         pass
-    return pd.DataFrame()
+    return pd.DataFrame(), ""
 
 def fetch_macro_api(symbol, stooq_symbol):
-    """宏观数据双源（带 curl_cffi 绕过 WAF）"""
+    """宏观指标抓取"""
     try:
-        session = cffi_requests.Session(impersonate="chrome110")
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
-        res = session.get(url, timeout=4)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
             meta = res.json()['chart']['result'][0]['meta']
             price = meta.get('regularMarketPrice', 0.0)
@@ -166,62 +186,61 @@ def fetch_macro_api(symbol, stooq_symbol):
     except Exception: pass
     
     try:
-        s_df = web.DataReader(stooq_symbol, 'stooq').head(2)
+        s_df, _ = fetch_chart_stooq_csv(stooq_symbol)
         if not s_df.empty and len(s_df) >= 2:
-            p1, p2 = s_df['Close'].iloc[0], s_df['Close'].iloc[1]
+            p1, p2 = s_df['Close'].iloc[-1], s_df['Close'].iloc[-2]
             return p1, (p1 / p2 - 1)
     except Exception: pass
     return 0.0, 0.0
 
 def do_fetch_stock_data(ticker_symbol):
-    """三级穿透抓取：cffi原生 -> yfinance库 -> Stooq库"""
+    """带四级多源防御的股票数据抓取核心"""
     now_ts = time.time()
     fetch_time_bj = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
     hist = pd.DataFrame()
-    info = {}
-    source = "Yahoo Finance (cffi穿透)"
-    
-    # 1. 优先：cffi 伪造指纹抓取
-    hist = fetch_chart_via_cffi(ticker_symbol)
-    
-    # 获取 info 股本信息
-    if not hist.empty:
-        try:
-            tk = yf.Ticker(ticker_symbol)
-            try: info = tk.info
-            except Exception: info = {}
-        except Exception: pass
+    source = ""
+    err_log = []
 
-    # 2. 备用：标准 yfinance 库
+    # 1. 尝试 Yahoo Direct API
+    hist, source = fetch_chart_yahoo_direct(ticker_symbol)
+    
+    # 2. 尝试 Stooq CSV 物理直连通道
+    if hist.empty:
+        hist, source = fetch_chart_stooq_csv(ticker_symbol)
+        
+    # 3. 尝试 yfinance 库抓取
     if hist.empty:
         try:
             tk = yf.Ticker(ticker_symbol)
             hist = tk.history(period="100d", interval="1d")
-            source = "Yahoo Finance (yfinance)"
-            try: info = tk.info
-            except Exception: info = {}
-        except Exception: pass
-
-    # 3. 兜底：Stooq
-    if hist.empty or len(hist) < 5:
-        try:
-            stooq_code = f"{ticker_symbol}.US" if "^" not in ticker_symbol and "." not in ticker_symbol else ticker_symbol
-            hist = web.DataReader(stooq_code, 'stooq').head(100).sort_index()
-            if not hist.empty: source = "Stooq (备用源)"
-        except Exception: pass
+            if not hist.empty:
+                source = "yfinance 库"
+        except Exception as e:
+            err_log.append(str(e))
 
     if hist.empty or len(hist) < 2:
-        return None
+        return None, f"数据源访问均失败 ({'; '.join(err_log) if err_log else '云端网络拦截'})"
 
     try:
-        btc, _ = fetch_macro_api("BTC-USD", "BTCUSD")
-        nasdaq, nasdaq_pct = fetch_macro_api("^IXIC", "^NDQ")
-        vix, vix_pct = fetch_macro_api("^VIX", "^VIX")
+        # 获取 info (隔离保护)
+        info = {}
+        try:
+            tk = yf.Ticker(ticker_symbol)
+            info = tk.info or {}
+        except Exception:
+            info = {}
+
+        btc, _ = fetch_macro_api("BTC-USD", "btc.us")
+        nasdaq, nasdaq_pct = fetch_macro_api("^IXIC", "^ndq")
+        vix, vix_pct = fetch_macro_api("^VIX", "^vix")
 
         exp_dates = []
-        try: exp_dates = list(yf.Ticker(ticker_symbol).options)
-        except Exception: exp_dates = []
+        try:
+            tk_opt = yf.Ticker(ticker_symbol)
+            exp_dates = list(tk_opt.options)
+        except Exception:
+            exp_dates = []
 
         capital, cap_type, float_shares, shares_out = resolve_dynamic_share_capital(info, ticker_symbol)
 
@@ -278,7 +297,7 @@ def do_fetch_stock_data(ticker_symbol):
         latest_vol = hist['Volume'].iloc[-1]
         rt_turnover, proj_turnover, trade_status = calculate_turnover_metrics(latest_vol, capital, now_ts)
 
-        return hist, reg_params, dark, exp_dates, {
+        return (hist, reg_params, dark, exp_dates, {
             'btc': btc, 'nasdaq': nasdaq, 'nasdaq_pct': nasdaq_pct, 
             'vix': vix, 'vix_pct': vix_pct, 
             'capital': capital, 'cap_type': cap_type,
@@ -286,9 +305,9 @@ def do_fetch_stock_data(ticker_symbol):
             'volume': latest_vol, 'source': source,
             'fetch_time': fetch_time_bj,
             'timestamp': now_ts 
-        }
-    except Exception:
-        return None
+        }), ""
+    except Exception as e:
+        return None, f"数据计算过程异常: {str(e)}"
 
 def get_raw_options_with_crumb(ticker_symbol, selected_exp):
     try:
@@ -437,7 +456,7 @@ def background_updater_loop():
             
             for ticker in tickers_to_process:
                 try:
-                    data = do_fetch_stock_data(ticker)
+                    data, _ = do_fetch_stock_data(ticker)
                     if data:
                         with GLOBAL_STORE["lock"]:
                             GLOBAL_STORE["stock_cache"][ticker] = data
@@ -508,10 +527,11 @@ last_ts = GLOBAL_STORE["fetch_timestamps"].get(ticker, 0)
 now_ts = time.time()
 
 is_expired = (now_ts - last_ts) > 180
+err_msg = ""
 
 if not stock_data or is_expired:
     with st.spinner(f"🔄 正在同步 **{ticker}** 最新市场数据..."):
-        fresh_data = do_fetch_stock_data(ticker)
+        fresh_data, err_msg = do_fetch_stock_data(ticker)
         if fresh_data:
             stock_data = fresh_data
             with GLOBAL_STORE["lock"]:
@@ -520,7 +540,7 @@ if not stock_data or is_expired:
                 GLOBAL_STORE["active_queue"].add(ticker)
 
 if not stock_data:
-    st.error(f"⚠️ {ticker} 股票数据拉取失败，请点击侧边栏重新切换或稍后再试。")
+    st.error(f"⚠️ {ticker} 股票数据拉取失败。原因: {err_msg if err_msg else '数据源暂时无响应'}。请重新选择股票或稍后再试。")
 else:
     hist_df, reg, dark_df, exp_dates, mkt = stock_data
     last = hist_df.iloc[-1]
