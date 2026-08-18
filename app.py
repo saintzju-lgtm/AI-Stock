@@ -198,6 +198,15 @@ def build_scenario_model(hist_df):
     y_h = (fit_df['High'] / fit_df['昨收'] - 1).values
     y_l = (fit_df['Low'] / fit_df['昨收'] - 1).values
 
+    # 兜底方案的线性回归参数:不管最终用不用分位数回归,都先把这份算好、存进模型里。
+    # 这样即使分位数回归在"拟合时"是成功的,但"预测时"(用最新一行数据算特征)遇到NaN导致崩溃,
+    # 也有一份现成的兜底参数可以立刻切换,不会让整个页面报错。
+    X_simple = fit_df[['gap']].values
+    fallback = {}
+    for tag, y in [('h', y_h), ('l', y_l)]:
+        m = LinearRegression().fit(X_simple, y)
+        fallback[f's_{tag}'], fallback[f'i_{tag}'] = m.coef_[0], m.intercept_
+
     if len(fit_df) >= 25:
         try:
             from sklearn.linear_model import QuantileRegressor
@@ -208,16 +217,11 @@ def build_scenario_model(hist_df):
                 # alpha 是L1正则强度,样本量不大时加一点正则避免系数被少数点带偏
                 models['h'][scene] = QuantileRegressor(quantile=q, alpha=0.3, solver='highs').fit(X, y_h)
                 models['l'][scene] = QuantileRegressor(quantile=q, alpha=0.3, solver='highs').fit(X, y_l)
-            return {'mode': 'quantile', 'models': models}
+            return {'mode': 'quantile', 'models': models, 'fallback_params': fallback}
         except Exception:
             pass  # 分位数回归失败(比如scipy版本太旧不支持highs求解器),落到下面的兜底
 
     # 兜底方案:样本不足或分位数回归失败,退回原来的简单线性回归 + 固定百分比
-    X_simple = fit_df[['gap']].values
-    fallback = {}
-    for tag, y in [('h', y_h), ('l', y_l)]:
-        m = LinearRegression().fit(X_simple, y)
-        fallback[f's_{tag}'], fallback[f'i_{tag}'] = m.coef_[0], m.intercept_
     return {'mode': 'linear_fallback', 'params': fallback}
 
 
@@ -232,35 +236,52 @@ def predict_scenarios(scenario_model, hist_df):
         return None, 'insufficient'
 
     gap = (last['Open'] - prev_close) / prev_close
+    if pd.isna(gap) or not np.isfinite(gap):
+        gap = 0.0  # 最新一行开盘价缺失时,当作"无跳空信息"处理,不让NaN往下传
 
-    if scenario_model['mode'] == 'quantile':
-        ret = hist_df['Close'].pct_change()
-        recent_vol = ret.rolling(10).std().iloc[-1]
-        if pd.isna(recent_vol):
-            recent_vol = ret.std()
-        X_pred = np.array([[gap, recent_vol]])
-        models = scenario_model['models']
-
-        h_vals = {scene: prev_close * (1 + models['h'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
-        l_vals = {scene: prev_close * (1 + models['l'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
-
-        # 分位数回归在小样本下偶尔会出现"分位数交叉"(比如10%分位算出来比50%分位还高),
-        # 这里做一次排序兜底,保证"乐观>中性>悲观"这个顺序始终符合直觉。
-        h_sorted = sorted(h_vals.values(), reverse=True)
-        l_sorted = sorted(l_vals.values(), reverse=True)
-        rows = [(scene, h_sorted[i], l_sorted[i]) for i, scene in enumerate(['乐观', '中性', '悲观'])]
-        return rows, 'quantile'
-
-    if scenario_model['mode'] == 'linear_fallback':
-        p = scenario_model['params']
-        p_h = prev_close * (1 + (p['i_h'] + p['s_h'] * gap))
-        p_l = prev_close * (1 + (p['i_l'] + p['s_l'] * gap))
-        rows = [
+    def _linear_rows(params):
+        p_h = prev_close * (1 + (params['i_h'] + params['s_h'] * gap))
+        p_l = prev_close * (1 + (params['i_l'] + params['s_l'] * gap))
+        return [
             ('乐观', p_h * 1.06, p_l * 1.06),
             ('中性', p_h, p_l),
             ('悲观', p_h * 0.94, p_l * 0.94),
         ]
-        return rows, 'linear_fallback'
+
+    if scenario_model['mode'] == 'quantile':
+        # 分位数回归的预测特征来自"最新一行"数据,拟合时用的是历史数据(已经dropna过),
+        # 两者不是同一批行,预测时仍可能遇到NaN(比如当天数据还没走完、Open缺失)。
+        # 这里做完整的有效性校验,任何一步失败都优雅降级到线性兜底,而不是让sklearn直接报错崩溃。
+        try:
+            ret = hist_df['Close'].pct_change()
+            recent_vol = ret.rolling(10).std().iloc[-1]
+            if pd.isna(recent_vol):
+                recent_vol = ret.std()
+            if pd.isna(recent_vol) or not np.isfinite(recent_vol):
+                recent_vol = 0.0
+
+            X_pred = np.array([[gap, recent_vol]], dtype=float)
+            if not np.all(np.isfinite(X_pred)):
+                raise ValueError("预测特征包含无效值(NaN/Inf)")
+
+            models = scenario_model['models']
+            h_vals = {scene: prev_close * (1 + models['h'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
+            l_vals = {scene: prev_close * (1 + models['l'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
+
+            # 分位数回归在小样本下偶尔会出现"分位数交叉"(比如10%分位算出来比50%分位还高),
+            # 这里做一次排序兜底,保证"乐观>中性>悲观"这个顺序始终符合直觉。
+            h_sorted = sorted(h_vals.values(), reverse=True)
+            l_sorted = sorted(l_vals.values(), reverse=True)
+            rows = [(scene, h_sorted[i], l_sorted[i]) for i, scene in enumerate(['乐观', '中性', '悲观'])]
+            return rows, 'quantile'
+        except Exception:
+            fb = scenario_model.get('fallback_params')
+            if fb:
+                return _linear_rows(fb), 'linear_fallback'
+            return None, 'insufficient'
+
+    if scenario_model['mode'] == 'linear_fallback':
+        return _linear_rows(scenario_model['params']), 'linear_fallback'
 
     return None, 'insufficient'
 
@@ -348,7 +369,10 @@ def do_fetch_stock_data(ticker_symbol):
         source = "Yahoo Finance"
 
         try:
-            hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"))
+            # K线这个主通道有 Stooq 这个完全独立的免费替代源做兜底,一旦失败就没必要死等重试
+            # (如果是IP被系统性限流,retry大概率还是失败,只会让用户多等几秒却什么都没换来)——
+            # 所以这里 max_retries=0,失败就立刻转向 Stooq,而不是先耗掉一次退避时间。
+            hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"), max_retries=0)
         except Exception:
             hist = pd.DataFrame()
 
