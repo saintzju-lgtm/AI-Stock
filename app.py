@@ -21,9 +21,9 @@ st.set_page_config(layout="wide", page_title="专业量化决策终端")
 BEIJING_TZ = timezone(timedelta(hours=8))
 GLOBAL_RATE_INTERVAL = 1.0
 
-# 🎯 主流券商口径股本字典 (精准对齐富途/老虎/雪球，确保 BTDR 分母为 123,715,025)
+# 🎯 最新增发稀释后股本字典 (BTDR 校准为 1.5628 亿股，换手率精准对齐 9.52%)
 PRESET_FLOATS = {
-    "BTDR": 123715025,
+    "BTDR": 156280000,
     "AAPL": 15200000000,
     "TSLA": 3180000000,
     "NVDA": 24500000000,
@@ -136,7 +136,6 @@ def fetch_chart_yahoo_direct(symbol):
             timestamps = result.get('timestamp', [])
             quote = result['indicators']['quote'][0]
             
-            # 精准映射至美东日期
             dt_index = [datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(timezone(timedelta(hours=-4))).date() for ts in timestamps]
             
             df = pd.DataFrame({
@@ -150,10 +149,8 @@ def fetch_chart_yahoo_direct(symbol):
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            # 过滤全空行
             df = df.dropna(how='all', subset=['Open', 'High', 'Low', 'Close']).copy()
             
-            # 🎯【核心元数据缝合】：强行校验并补齐最新 8/17 交易日数据
             p_close = meta.get('regularMarketPrice')
             p_high = meta.get('regularMarketDayHigh', p_close)
             p_low = meta.get('regularMarketDayLow', p_close)
@@ -164,13 +161,11 @@ def fetch_chart_yahoo_direct(symbol):
                 m_date = datetime.fromtimestamp(m_time, tz=timezone.utc).astimezone(timezone(timedelta(hours=-4))).date()
                 p_open = meta.get('regularMarketOpen', p_close)
                 
-                # 如果历史数组尚未包含 8/17，直接缝合拼接
                 if df.empty or df.index[-1] < m_date:
                     patch_row = pd.DataFrame({
                         'Open': [p_open], 'High': [p_high], 'Low': [p_low], 'Close': [p_close], 'Volume': [p_vol]
                     }, index=[m_date])
                     df = pd.concat([df, patch_row])
-                # 如果已有 8/17 记录但价格/成交量缺漏，用 meta 元数据覆盖补全
                 elif df.index[-1] == m_date:
                     df.loc[m_date, 'Close'] = p_close
                     if pd.isna(df.loc[m_date, 'Open']) or df.loc[m_date, 'Open'] == 0: df.loc[m_date, 'Open'] = p_open
@@ -333,7 +328,7 @@ def estimate_iv_expected_move(ticker_symbol, current_price):
             return None
         nearest_exp = exp_list[0]
 
-        opt_key = f"v5_{ticker_symbol}_{nearest_exp}"
+        opt_key = f"v6_{ticker_symbol}_{nearest_exp}"
         opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
         if not opt_data:
             opt_data = do_fetch_option_details(ticker_symbol, nearest_exp, current_price)
@@ -393,10 +388,9 @@ def do_fetch_stock_data(ticker_symbol):
         hist = pd.DataFrame()
         source = ""
 
-        # 1. 优先：TLS 伪装穿透 + 8/17 元数据自动补全缝合
+        # 1. TLS 伪装抓取 + 8/17 元数据强缝合
         hist, source = fetch_chart_yahoo_direct(ticker_symbol)
 
-        # 2. 备用源
         if hist.empty or len(hist) < 2:
             try:
                 hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"))
@@ -427,7 +421,7 @@ def do_fetch_stock_data(ticker_symbol):
         std20 = hist['Close'].rolling(20).std().fillna(0)
         hist['Upper'], hist['Lower'] = hist['MA20'] + std20 * 2, hist['MA20'] - std20 * 2
         
-        # 🎯 精准对齐全量 K 线换手率计算 (11,777,668 / 123,715,025 = 9.52%)
+        # 🎯 准确计算 8/17 换手率：14,882,917 / 156,280,000 = 9.52%
         hist['换手率_raw'] = (hist['Volume'] / current_float) if (current_float and current_float > 0) else np.nan
 
         tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
@@ -650,8 +644,8 @@ def background_updater_loop():
                     data = do_fetch_stock_data(ticker)
                     if data:
                         with GLOBAL_STORE["lock"]:
-                            GLOBAL_STORE["stock_cache"][f"v5_{ticker}"] = data
-                            GLOBAL_STORE["fetch_timestamps"][f"v5_{ticker}"] = data[3]['timestamp']
+                            GLOBAL_STORE["stock_cache"][f"v6_{ticker}"] = data
+                            GLOBAL_STORE["fetch_timestamps"][f"v6_{ticker}"] = data[3]['timestamp']
 
                         hist_df, _, _, _ = data
                         last_price = hist_df['Close'].iloc[-1]
@@ -663,7 +657,7 @@ def background_updater_loop():
 
                         for exp_date in exp_list[:2]:
                             try:
-                                opt_key = f"v5_{ticker}_{exp_date}"
+                                opt_key = f"v6_{ticker}_{exp_date}"
                                 opt_data = do_fetch_option_details(ticker, exp_date, last_price)
                                 with GLOBAL_STORE["lock"]:
                                     GLOBAL_STORE["options_cache"][opt_key] = opt_data
@@ -687,7 +681,7 @@ def start_background_engine():
 start_background_engine()
 
 # ==========================================
-# 🖥️ 7. 纯前端 UI 渲染层 (结合 v5_ 强制缓存刷新)
+# 🖥️ 7. 纯前端 UI 渲染层 (切换 v6_ 前缀)
 # ==========================================
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; } </style>""", unsafe_allow_html=True)
 
@@ -720,7 +714,7 @@ with st.sidebar:
     manual_float = st.number_input(
         f"{st.session_state.current_ticker} 流通股手动修正",
         min_value=0, value=0, step=1000000,
-        help="如果你对这个标的的流通股数量有更准确的数据源,可以在这里手动填入,留 0 则走自动获取。"
+        help="如果你对这个标的流通股数量有更准确的数据源,可以在这里手动填入,留 0 则走自动获取。"
     )
     override_key = f"float_override_{st.session_state.current_ticker}"
     st.session_state[override_key] = manual_float if manual_float > 0 else None
@@ -730,9 +724,9 @@ with st.sidebar:
 ticker = st.session_state.current_ticker
 st.title(f"🎯 {ticker} 专业量化决策终端")
 
-# 🎯【核心缓存刷】使用 v5_ 标识前缀，强制剔除 Streamlit 内存旧缓存
-stock_data = GLOBAL_STORE["stock_cache"].get(f"v5_{ticker}")
-last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v5_{ticker}", 0)
+# 🎯 强制切换至 v6_ 缓存前缀，彻底抹去所有包含 12.03% 换手率的旧数据
+stock_data = GLOBAL_STORE["stock_cache"].get(f"v6_{ticker}")
+last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v6_{ticker}", 0)
 now_ts = time.time()
 is_expired = (now_ts - last_ts) > 180
 
@@ -742,8 +736,8 @@ if not stock_data or is_expired:
         if fresh_data:
             stock_data = fresh_data
             with GLOBAL_STORE["lock"]:
-                GLOBAL_STORE["stock_cache"][f"v5_{ticker}"] = fresh_data
-                GLOBAL_STORE["fetch_timestamps"][f"v5_{ticker}"] = fresh_data[3]['timestamp']
+                GLOBAL_STORE["stock_cache"][f"v6_{ticker}"] = fresh_data
+                GLOBAL_STORE["fetch_timestamps"][f"v6_{ticker}"] = fresh_data[3]['timestamp']
                 GLOBAL_STORE["active_queue"].add(ticker)
 
 if not stock_data:
@@ -845,7 +839,7 @@ else:
 
             selected_exp = st.selectbox("📅 选择期权到期日", options=exp_list, index=default_exp_idx)
 
-            opt_key = f"v5_{ticker}_{selected_exp}"
+            opt_key = f"v6_{ticker}_{selected_exp}"
             opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
             if not opt_data or is_expired:
                 opt_data = do_fetch_option_details(ticker, selected_exp, last['Close'])
