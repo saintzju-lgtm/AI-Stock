@@ -21,7 +21,7 @@ st.set_page_config(layout="wide", page_title="专业量化决策终端")
 BEIJING_TZ = timezone(timedelta(hours=8))
 GLOBAL_RATE_INTERVAL = 1.0
 
-# 🎯 基准股本字典 (BTDR 已校准为 1.5628 亿股，8/17 换手率精准对齐 9.52%)
+# 🎯 基准股本字典 (BTDR 校准为 1.5628 亿股)
 PRESET_FLOATS = {
     "BTDR": 156280000,
     "AAPL": 15200000000,
@@ -33,7 +33,7 @@ PRESET_FLOATS = {
 }
 
 # ==========================================
-# 🧠 1. 全局解耦内存存储中心与网络引擎
+# 🧠 1. 全局解耦内存存储中心
 # ==========================================
 @st.cache_resource
 def get_global_data_store():
@@ -41,7 +41,6 @@ def get_global_data_store():
         "stock_cache": {},
         "options_cache": {},
         "fetch_timestamps": {},
-        "crumb_cache": None,
         "active_queue": set(["BTDR", "AAPL", "TSLA", "NVDA"]),
         "lock": threading.Lock(),
         "last_yahoo_call_ts": 0.0,
@@ -55,26 +54,6 @@ def get_dynamic_ttl():
     if now_est.weekday() >= 5 or now_est.hour < 9 or (now_est.hour == 9 and now_est.minute < 30) or now_est.hour >= 16:
         return 1800
     return 180
-
-def get_persistent_yahoo_session():
-    """Crumb 与 Session 缓存 6 小时"""
-    with GLOBAL_STORE["lock"]:
-        cached = GLOBAL_STORE.get("crumb_cache")
-        now = time.time()
-        if cached and (now - cached["time"] < 21600):
-            return cached["session"], cached["crumb"]
-
-        try:
-            session = cffi_requests.Session(impersonate="chrome110")
-            session.get("https://fc.yahoo.com", timeout=4)
-            crumb_res = session.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=4)
-            crumb = crumb_res.text.strip()
-            if crumb and len(crumb) < 30 and "{" not in crumb:
-                GLOBAL_STORE["crumb_cache"] = {"session": session, "crumb": crumb, "time": now}
-                return session, crumb
-        except Exception:
-            pass
-        return cffi_requests.Session(impersonate="chrome110"), ""
 
 def _throttled_yahoo_call(func, max_retries=1):
     last_err = None
@@ -151,12 +130,11 @@ def get_effective_float(ticker_symbol):
     return get_share_stats(ticker_symbol)
 
 # ==========================================
-# 🚀 4. 多源数据抓取降级引擎 (Multi-Source Engine)
+# 🚀 4. K 线数据抓取引擎
 # ==========================================
 def fetch_chart_yahoo_direct(symbol):
-    """【源 1】Yahoo TLS 穿透 + 8/17 元数据自动缝合"""
     try:
-        session, _ = get_persistent_yahoo_session()
+        session = cffi_requests.Session(impersonate="chrome110")
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range=120d&interval=1d&includePrePost=false"
         res = session.get(url, timeout=5)
         if res.status_code == 200:
@@ -205,38 +183,12 @@ def fetch_chart_yahoo_direct(symbol):
             df = df[~df.index.duplicated(keep='last')].sort_index()
             df = df.ffill().bfill()
             if len(df) >= 2:
-                return df, "Yahoo TLS 穿透"
-    except Exception:
-        pass
-    return pd.DataFrame(), ""
-
-def fetch_chart_alpha_vantage(symbol):
-    """【源 2】Alpha Vantage 免费 API 降级（存在 st.secrets 时触发）"""
-    api_key = st.secrets.get("ALPHA_VANTAGE_KEY") if hasattr(st, "secrets") else None
-    if not api_key:
-        return pd.DataFrame(), ""
-    try:
-        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={api_key}"
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            data = res.json().get("Time Series (Daily)", {})
-            if data:
-                df = pd.DataFrame.from_dict(data, orient='index')
-                df = df.rename(columns={
-                    '1. open': 'Open', '2. high': 'High',
-                    '3. low': 'Low', '4. close': 'Close', '5. volume': 'Volume'
-                })
-                df.index = pd.to_datetime(df.index).date
-                df = df.sort_index().tail(100)
-                for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                return df, "Alpha Vantage API"
+                return df, "Yahoo TLS 缝合引擎"
     except Exception:
         pass
     return pd.DataFrame(), ""
 
 def fetch_chart_stooq_csv(symbol):
-    """【源 3】Stooq 物理 CSV 通道（免 Key 硬核兜底）"""
     try:
         clean_sym = symbol.lower().split('.')[0].replace('^', '')
         stooq_sym = f"{clean_sym}.us" if not symbol.startswith('^') and '-USD' not in symbol else clean_sym
@@ -254,14 +206,14 @@ def fetch_chart_stooq_csv(symbol):
             df = df.dropna(subset=['Close']).copy()
             df.index = pd.to_datetime(df.index).date
             if len(df) >= 2:
-                return df, "Stooq CSV 兜底"
+                return df, "Stooq CSV 通道"
     except Exception:
         pass
     return pd.DataFrame(), ""
 
 def fetch_macro_api(symbol, stooq_symbol):
     try:
-        session, _ = get_persistent_yahoo_session()
+        session = cffi_requests.Session(impersonate="chrome110")
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
         res = session.get(url, timeout=3)
         if res.status_code == 200:
@@ -384,7 +336,7 @@ def estimate_iv_expected_move(ticker_symbol, current_price):
             return None
         nearest_exp = exp_list[0]
 
-        opt_key = f"v8_{ticker_symbol}_{nearest_exp}"
+        opt_key = f"v9_{ticker_symbol}_{nearest_exp}"
         opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
         if not opt_data:
             opt_data = do_fetch_option_details(ticker_symbol, nearest_exp, current_price)
@@ -437,7 +389,6 @@ def calculate_turnover_metrics(volume, capital, timestamp_unix):
         return realtime_turnover, realtime_turnover, "已收盘/盘后"
 
 def do_fetch_stock_data(ticker_symbol):
-    """🎯 四级自动无缝降级逻辑"""
     try:
         now_ts = time.time()
         fetch_time_bj = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
@@ -445,26 +396,22 @@ def do_fetch_stock_data(ticker_symbol):
         hist = pd.DataFrame()
         source = ""
 
-        # 降级链 1: Yahoo Direct TLS 穿透
         hist, source = fetch_chart_yahoo_direct(ticker_symbol)
 
-        # 降级链 2: Alpha Vantage (如存在秘钥)
-        if hist.empty or len(hist) < 2:
-            hist, source = fetch_chart_alpha_vantage(ticker_symbol)
-
-        # 降级链 3: Stooq 物理 CSV 通道 (无 Key 硬核兜底)
-        if hist.empty or len(hist) < 2:
-            hist, source = fetch_chart_stooq_csv(ticker_symbol)
-
-        # 降级链 4: yfinance 库备份
         if hist.empty or len(hist) < 2:
             try:
                 hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"))
                 if not hist.empty:
                     hist.index = pd.to_datetime(hist.index).date
-                    source = "yfinance 库"
+                    source = "yfinance 官方库"
             except Exception:
                 hist = pd.DataFrame()
+
+        if hist.empty or len(hist) < 2:
+            try:
+                hist, source = fetch_chart_stooq_csv(ticker_symbol)
+            except Exception:
+                pass
 
         if hist.empty or len(hist) < 2:
             return None
@@ -516,19 +463,65 @@ def do_fetch_stock_data(ticker_symbol):
         return None
 
 # ==========================================
-# 🎯 5. 期权链模块
+# 🎯 5. 核心重构期权链模块 (免 Crumb 陷阱直连)
 # ==========================================
-def get_expiration_list(ticker_symbol):
-    try:
-        session, crumb = get_persistent_yahoo_session()
-        url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker_symbol}?crumb={crumb}"
-        res = session.get(url, timeout=5)
-        if res.status_code == 200:
-            timestamps = res.json()['optionChain']['result'][0].get('expirationDates', [])
-            return [datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d') for ts in timestamps]
-    except Exception:
-        pass
+def fetch_yahoo_options_raw(ticker_symbol, selected_exp=None):
+    """
+    🎯【核心重构】免 Crumb 穿透提取期权数据，避免因为空的 crumb= 参数抛出 401 错误
+    """
+    session = cffi_requests.Session(impersonate="chrome110")
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
     
+    url_params = ""
+    if selected_exp:
+        try:
+            exp_ts = int(datetime.strptime(selected_exp, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp())
+            url_params = f"?date={exp_ts}"
+        except Exception:
+            pass
+            
+    for domain in ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]:
+        # 1. 优先：免 Crumb 直接向公开 API 发起请求
+        try:
+            url = f"https://{domain}/v7/finance/options/{ticker_symbol}{url_params}"
+            res = session.get(url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                result = data.get('optionChain', {}).get('result', [])
+                if result:
+                    return result[0]
+        except Exception:
+            pass
+            
+        # 2. 备用：如遇到特殊拦截，带合法 Crumb 重试
+        try:
+            session.get("https://fc.yahoo.com", headers=headers, timeout=3)
+            crumb_res = session.get(f"https://{domain}/v1/test/getcrumb", headers=headers, timeout=3)
+            crumb = crumb_res.text.strip()
+            if crumb and len(crumb) < 30 and "{" not in crumb:
+                delimiter = "&" if url_params else "?"
+                url_crumb = f"https://{domain}/v7/finance/options/{ticker_symbol}{url_params}{delimiter}crumb={crumb}"
+                res_c = session.get(url_crumb, headers=headers, timeout=5)
+                if res_c.status_code == 200:
+                    data = res_c.json()
+                    result = data.get('optionChain', {}).get('result', [])
+                    if result:
+                        return result[0]
+        except Exception:
+            pass
+            
+    return None
+
+def get_expiration_list(ticker_symbol):
+    res_data = fetch_yahoo_options_raw(ticker_symbol)
+    if res_data and 'expirationDates' in res_data:
+        timestamps = res_data['expirationDates']
+        return [datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d') for ts in timestamps]
+    
+    # 最终降级：yfinance 官方库
     try:
         tk = yf.Ticker(ticker_symbol)
         return _throttled_yahoo_call(lambda: list(tk.options))
@@ -536,19 +529,12 @@ def get_expiration_list(ticker_symbol):
         return []
 
 def get_raw_options_with_crumb(ticker_symbol, selected_exp):
-    try:
-        session, crumb = get_persistent_yahoo_session()
-        exp_ts = int(datetime.strptime(selected_exp, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp())
-        url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker_symbol}?date={exp_ts}&crumb={crumb}"
-        res = session.get(url, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            options = data['optionChain']['result'][0].get('options', [{}])[0]
-            calls = pd.DataFrame(options.get('calls', []))
-            puts = pd.DataFrame(options.get('puts', []))
-            return calls, puts
-    except Exception:
-        pass
+    res_data = fetch_yahoo_options_raw(ticker_symbol, selected_exp)
+    if res_data and 'options' in res_data and len(res_data['options']) > 0:
+        opt = res_data['options'][0]
+        calls = pd.DataFrame(opt.get('calls', []))
+        puts = pd.DataFrame(opt.get('puts', []))
+        return calls, puts
     return pd.DataFrame(), pd.DataFrame()
 
 def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_price):
@@ -699,8 +685,8 @@ def background_updater_loop():
                     data = do_fetch_stock_data(ticker)
                     if data:
                         with GLOBAL_STORE["lock"]:
-                            GLOBAL_STORE["stock_cache"][f"v8_{ticker}"] = data
-                            GLOBAL_STORE["fetch_timestamps"][f"v8_{ticker}"] = data[3]['timestamp']
+                            GLOBAL_STORE["stock_cache"][f"v9_{ticker}"] = data
+                            GLOBAL_STORE["fetch_timestamps"][f"v9_{ticker}"] = data[3]['timestamp']
                 except Exception:
                     pass
                 time.sleep(2.0)
@@ -718,7 +704,7 @@ def start_background_engine():
 start_background_engine()
 
 # ==========================================
-# 🖥️ 7. 纯前端 UI 渲染层 (切换 v8_ 前缀)
+# 🖥️ 7. 纯前端 UI 渲染层 (切换 v9_ 强刷缓存)
 # ==========================================
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; } </style>""", unsafe_allow_html=True)
 
@@ -761,9 +747,9 @@ with st.sidebar:
 ticker = st.session_state.current_ticker
 st.title(f"🎯 {ticker} 专业量化决策终端")
 
-# 🎯 切换至 v8_ 缓存前缀
-stock_data = GLOBAL_STORE["stock_cache"].get(f"v8_{ticker}")
-last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v8_{ticker}", 0)
+# 🎯 切换至 v9_ 强刷新缓存，丢弃死锁的空期权数据
+stock_data = GLOBAL_STORE["stock_cache"].get(f"v9_{ticker}")
+last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v9_{ticker}", 0)
 now_ts = time.time()
 is_expired = (now_ts - last_ts) > get_dynamic_ttl()
 
@@ -773,8 +759,8 @@ if not stock_data or is_expired:
         if fresh_data:
             stock_data = fresh_data
             with GLOBAL_STORE["lock"]:
-                GLOBAL_STORE["stock_cache"][f"v8_{ticker}"] = fresh_data
-                GLOBAL_STORE["fetch_timestamps"][f"v8_{ticker}"] = fresh_data[3]['timestamp']
+                GLOBAL_STORE["stock_cache"][f"v9_{ticker}"] = fresh_data
+                GLOBAL_STORE["fetch_timestamps"][f"v9_{ticker}"] = fresh_data[3]['timestamp']
                 GLOBAL_STORE["active_queue"].add(ticker)
 
 if not stock_data:
@@ -876,7 +862,7 @@ else:
 
             selected_exp = st.selectbox("📅 选择期权到期日", options=exp_list, index=default_exp_idx)
 
-            opt_key = f"v8_{ticker}_{selected_exp}"
+            opt_key = f"v9_{ticker}_{selected_exp}"
             opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
             if not opt_data or is_expired:
                 opt_data = do_fetch_option_details(ticker, selected_exp, last['Close'])
