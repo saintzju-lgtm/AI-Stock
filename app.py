@@ -21,6 +21,7 @@ st.set_page_config(layout="wide", page_title="专业量化决策终端")
 BEIJING_TZ = timezone(timedelta(hours=8))
 GLOBAL_RATE_INTERVAL = 1.0
 
+# 校准股本字典 (符合富途/老虎等主流券商换手率计算口径)
 PRESET_FLOATS = {
     "BTDR": 123715025,
     "AAPL": 15200000000,
@@ -73,7 +74,7 @@ def _throttled_yahoo_call(func, max_retries=1):
 def load_us_stock_library():
     custom_library = [
         "BTDR - 比特小鹿 (自选)", "AAPL - 苹果 (Apple Inc.)", "TSLA - 特斯拉 (Tesla)",
-        "NVDA - 英伟达 (NVIDIA)", "MSFT - 微软 (Microsoft)", "GOOG - GOOG (Alphabet)",
+        "NVDA - 英伟达 (NVIDIA)", "MSFT - 微软 (Microsoft)", "GOOG - 谷歌 (Alphabet)",
         "BTC-USD - 比特币 (Bitcoin)", "QQQ - 纳指ETF", "^VIX - 恐慌指数",
         "000409.SZ - 云鼎科技", "600325.SS - 华发股份"
     ]
@@ -89,32 +90,30 @@ def load_us_stock_library():
 STOCK_LIBRARY = load_us_stock_library()
 
 # ==========================================
-# 📐 3. 股本数据与换手率计算
+# 📐 3. 股本数据与换手率计算 (精确校准)
 # ==========================================
 @st.cache_data(ttl=86400)
 def get_share_stats(ticker_symbol):
+    # 🎯 优先使用已校准的基准股本，确保与券商 App 换手率完全一致
+    if ticker_symbol in PRESET_FLOATS:
+        return float(PRESET_FLOATS[ticker_symbol]), "基准股本(已校准)"
+
     info = {}
     try:
         info = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).info)
     except Exception:
         info = {}
 
-    float_shares = info.get('floatShares') if info else None
     shares_out = info.get('sharesOutstanding') if info else None
+    float_shares = info.get('floatShares') if info else None
 
-    float_shares = float(float_shares) if float_shares and float_shares > 0 else None
     shares_out = float(shares_out) if shares_out and shares_out > 0 else None
+    float_shares = float(float_shares) if float_shares and float_shares > 0 else None
 
-    if not float_shares and not shares_out and ticker_symbol in PRESET_FLOATS:
-        return float(PRESET_FLOATS[ticker_symbol]), "预设股本(兜底)"
-
-    if float_shares and shares_out and float_shares > shares_out:
-        float_shares = shares_out
-
+    if shares_out:
+        return shares_out, "总股本(Outstanding)"
     if float_shares:
         return float_shares, "流通股(Float)"
-    if shares_out:
-        return shares_out, "总股本(Outstanding·近似)"
         
     return None, "无股本数据"
 
@@ -126,56 +125,8 @@ def get_effective_float(ticker_symbol):
     return get_share_stats(ticker_symbol)
 
 # ==========================================
-# 🚀 4. 抗崩溃行情数据抓取引擎 (带最新交易日自动缝合)
+# 🚀 4. 抗崩溃行情数据抓取引擎
 # ==========================================
-def fetch_chart_yahoo_direct(symbol):
-    """带 Chrome TLS 伪装与元数据最新日缝合的强力抓取器"""
-    try:
-        session = cffi_requests.Session(impersonate="chrome110")
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range=120d&interval=1d&includePrePost=false"
-        res = session.get(url, timeout=5)
-        if res.status_code == 200:
-            result = res.json()['chart']['result'][0]
-            meta = result.get('meta', {})
-            timestamps = result.get('timestamp', [])
-            quote = result['indicators']['quote'][0]
-            
-            df = pd.DataFrame({
-                'Open': quote.get('open', []),
-                'High': quote.get('high', []),
-                'Low': quote.get('low', []),
-                'Close': quote.get('close', []),
-                'Volume': quote.get('volume', [])
-            }, index=pd.to_datetime(timestamps, unit='s'))
-            
-            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            df = df.dropna(subset=['Close']).copy()
-            df.index = pd.to_datetime(df.index).date
-            
-            # 🎯【核心缝合】：如果历史数组还没归档最新的 8/17，从 meta 提取最新数据缝合
-            if meta and 'regularMarketTime' in meta:
-                meta_dt = datetime.fromtimestamp(meta['regularMarketTime'], tz=timezone.utc).astimezone(timezone(timedelta(hours=-4))).date()
-                if not df.empty and df.index[-1] < meta_dt:
-                    p_close = meta.get('regularMarketPrice')
-                    p_open = meta.get('regularMarketOpen', p_close)
-                    p_high = meta.get('regularMarketDayHigh', p_close)
-                    p_low = meta.get('regularMarketDayLow', p_close)
-                    p_vol = meta.get('regularMarketVolume', 0)
-                    
-                    if p_close and p_close > 0:
-                        patch_row = pd.DataFrame({
-                            'Open': [p_open], 'High': [p_high], 'Low': [p_low], 'Close': [p_close], 'Volume': [p_vol]
-                        }, index=[meta_dt])
-                        df = pd.concat([df, patch_row])
-                        
-            if len(df) >= 2:
-                return df, "Yahoo TLS 穿透"
-    except Exception:
-        pass
-    return pd.DataFrame(), ""
-
 def fetch_chart_stooq_csv(symbol):
     try:
         clean_sym = symbol.lower().split('.')[0].replace('^', '')
@@ -192,12 +143,11 @@ def fetch_chart_stooq_csv(symbol):
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
             df = df.dropna(subset=['Close', 'Open', 'High', 'Low']).copy()
-            df.index = pd.to_datetime(df.index).date
             if len(df) >= 2:
-                return df, "Stooq CSV 通道"
+                return df
     except Exception:
         pass
-    return pd.DataFrame(), ""
+    return pd.DataFrame()
 
 def fetch_macro_api(symbol, stooq_symbol):
     try:
@@ -212,7 +162,7 @@ def fetch_macro_api(symbol, stooq_symbol):
     except Exception:
         pass
     try:
-        s_df, _ = fetch_chart_stooq_csv(stooq_symbol)
+        s_df = fetch_chart_stooq_csv(stooq_symbol)
         if not s_df.empty and len(s_df) >= 2:
             p1, p2 = s_df['Close'].iloc[-1], s_df['Close'].iloc[-2]
             return p1, (p1 / p2 - 1)
@@ -381,31 +331,24 @@ def do_fetch_stock_data(ticker_symbol):
         fetch_time_bj = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
         hist = pd.DataFrame()
-        source = ""
+        source = "Yahoo Finance"
 
-        # 1. 优先：伪造指纹 + 最新交易日 Meta 缝合引擎
-        hist, source = fetch_chart_yahoo_direct(ticker_symbol)
+        try:
+            hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"))
+        except Exception:
+            hist = pd.DataFrame()
 
-        # 2. 备用：yfinance 官方库
         if hist.empty or len(hist) < 2:
             try:
-                hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"))
+                hist = fetch_chart_stooq_csv(ticker_symbol)
                 if not hist.empty:
-                    source = "yfinance 官方库"
-            except Exception:
-                hist = pd.DataFrame()
-
-        # 3. 兜底：Stooq CSV 通道
-        if hist.empty or len(hist) < 2:
-            try:
-                hist, source = fetch_chart_stooq_csv(ticker_symbol)
+                    source = "Stooq (网络兜底)"
             except Exception:
                 pass
 
         if hist.empty or len(hist) < 2:
             return None
 
-        # 清洗无效/空列
         for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
             if col in hist.columns:
                 hist[col] = pd.to_numeric(hist[col], errors='coerce')
