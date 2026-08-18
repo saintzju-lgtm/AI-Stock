@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone, timedelta
 import threading
 import requests
+from io import StringIO
 import pandas_datareader.data as web
 
 # ==========================================
@@ -18,9 +19,19 @@ st.set_page_config(layout="wide", page_title="专业量化决策终端")
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-# 全局最小请求间隔(秒):所有打向 Yahoo 的请求(不管前台点击还是后台线程)共享同一个节流器,
-# 目的是"别去触发限流",而不是"触发了之后想办法绕过去"。
+# 全局最小请求间隔(秒)
 GLOBAL_RATE_INTERVAL = 1.5
+
+# 预设股本兜底字典 (当 API 接口在云端被封锁/超时拿不到 info 时自动启动)
+PRESET_FLOATS = {
+    "BTDR": 123715025,
+    "AAPL": 15200000000,
+    "TSLA": 3180000000,
+    "NVDA": 24500000000,
+    "MSFT": 7430000000,
+    "GOOG": 12300000000,
+    "QQQ": 600000000
+}
 
 # ==========================================
 # 🧠 1. 全局解耦内存存储中心
@@ -29,7 +40,7 @@ GLOBAL_RATE_INTERVAL = 1.5
 def get_global_data_store():
     return {
         "stock_cache": {},
-        "options_cache": {},     # key: f"{ticker}_{expiration}" -> option result tuple
+        "options_cache": {},      # key: f"{ticker}_{expiration}" -> option result tuple
         "fetch_timestamps": {},
         "active_queue": set(["BTDR", "AAPL", "TSLA", "NVDA"]),
         "lock": threading.Lock(),
@@ -41,10 +52,7 @@ GLOBAL_STORE = get_global_data_store()
 
 def _throttled_yahoo_call(func, max_retries=1):
     """
-    所有对 Yahoo(不管是走 yfinance 库,还是直接 requests 打 Yahoo 的公开接口)的网络请求统一走这里:
-      - 全局节流:整个应用共享一个最小请求间隔,避免并发/高频触发限流。
-      - 遇到 429/Too Many Requests 就退避重试一次,超过重试次数就老实报错并提示稍后再试。
-      - 不做代理轮换、身份伪装、伪造 User-Agent 池等任何"绕过限制"的操作。
+    网络请求统一全局节流控制
     """
     last_err = None
     for attempt in range(max_retries + 1):
@@ -59,7 +67,7 @@ def _throttled_yahoo_call(func, max_retries=1):
             last_err = e
             msg = str(e)
             if ("429" in msg or "Too Many Requests" in msg) and attempt < max_retries:
-                time.sleep(8 + attempt * 7)  # 老实退避,不做规避
+                time.sleep(8 + attempt * 7)
                 continue
             raise
     raise last_err
@@ -88,72 +96,39 @@ def load_us_stock_library():
 STOCK_LIBRARY = load_us_stock_library()
 
 # ==========================================
-# 📐 3. 股本数据(换手率分母)
+# 📐 3. 股本数据(换手率分母 + 双重兜底)
 # ==========================================
 @st.cache_data(ttl=86400)
 def get_share_stats(ticker_symbol):
-    """
-    换手率分母修复:
-      - 不再用硬编码字典(会随增发/回购/拆股过时)。
-      - 优先用"流通股 floatShares",拿不到才退回"总股本 sharesOutstanding"。
-      - 明确返回用的是哪种口径,UI上标注出来,避免两种不同含义的数字被当成同一件事看。
-      - 每天刷新一次,不绑死在行情缓存的生命周期里。
-      - 流通股在逻辑上不可能超过总股本;如果数据源给出了自相矛盾的数字,
-        直接用总股本封顶,不用任何拍脑袋的百分比去"修正"(那种修正本身没有数据依据,
-        对本来流通股就接近100%总股本的公司反而会引入新的错误)。
-    """
-    float_shares = None
-    shares_out = None
-
-    # 第一优先级:fast_info —— 轻量级报价接口,不需要走 info 那套容易失败的 crumb/多模块聚合请求。
-    # 实测中 info 经常因为 Yahoo 反爬策略变化返回空字典(不报错,只是啥都没有),
-    # 但 fast_info 通常还能拿到股本数据,是更稳的第一手来源。
-    try:
-        fi = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).fast_info)
-        fi_shares = fi.get('shares') if fi else None
-        if fi_shares and fi_shares > 0:
-            shares_out = float(fi_shares)
-    except Exception:
-        pass
-
-    # 第二优先级:get_shares_full —— 专门的股本历史接口,同样比 info 轻量,失败概率更低。
-    if not shares_out:
-        try:
-            shares_series = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).get_shares_full(start="2020-01-01"))
-            if shares_series is not None and len(shares_series) > 0:
-                last_val = shares_series.dropna().iloc[-1] if hasattr(shares_series, "dropna") else None
-                if last_val and last_val > 0:
-                    shares_out = float(last_val)
-        except Exception:
-            pass
-
-    # 第三优先级:info —— 最容易被限流/因 crumb 失效返回空字典,但只有它能给"流通股(floatShares)"
-    # 这个更精确的口径,所以仍然尝试,只是不再把它当成唯一数据源。
+    info = {}
     try:
         info = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).info)
     except Exception:
         info = {}
 
-    info_float = info.get('floatShares')
-    info_out = info.get('sharesOutstanding')
+    float_shares = info.get('floatShares') if info else None
+    shares_out = info.get('sharesOutstanding') if info else None
 
-    if info_float and info_float > 0:
-        float_shares = float(info_float)
-    if not shares_out and info_out and info_out > 0:
-        shares_out = float(info_out)
+    float_shares = float(float_shares) if float_shares and float_shares > 0 else None
+    shares_out = float(shares_out) if shares_out and shares_out > 0 else None
+
+    # 兜底：若 API 被限流或返回空，自动启动预设股本保底
+    if not float_shares and not shares_out and ticker_symbol in PRESET_FLOATS:
+        return float(PRESET_FLOATS[ticker_symbol]), "预设股本(兜底)"
 
     if float_shares and shares_out and float_shares > shares_out:
-        float_shares = shares_out  # 逻辑封顶,不做无依据的百分比修正
+        float_shares = shares_out  # 逻辑封顶
 
     if float_shares:
         return float_shares, "流通股(Float)"
     if shares_out:
         return shares_out, "总股本(Outstanding·近似)"
+        
     return None, "无股本数据"
 
 
 def get_effective_float(ticker_symbol):
-    """支持侧边栏手动修正:如果你对某个标的的股本有更准的数据源,可以自己填,不用改代码。"""
+    """支持侧边栏手动修正"""
     override_key = f"float_override_{ticker_symbol}"
     override_val = st.session_state.get(override_key)
     if override_val and override_val > 0:
@@ -162,8 +137,29 @@ def get_effective_float(ticker_symbol):
 
 
 # ==========================================
-# 🚀 4. 抗崩溃行情数据抓取引擎(个股 K 线 / 宏观指数)
+# 🚀 4. 抗崩溃行情数据抓取引擎
 # ==========================================
+def fetch_chart_stooq_csv(symbol):
+    """Stooq 物理 CSV 通道 (网络兜底)"""
+    try:
+        clean_sym = symbol.lower().split('.')[0].replace('^', '')
+        stooq_sym = f"{clean_sym}.us" if not symbol.startswith('^') and '-USD' not in symbol else clean_sym
+        url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=4)
+        if res.status_code == 200 and "Date" in res.text:
+            df = pd.read_csv(StringIO(res.text))
+            df.columns = [c.capitalize() for c in df.columns]
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date').sort_index()
+            df = df.dropna(subset=['Close']).copy()
+            if len(df) >= 2:
+                return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
 def fetch_macro_api(symbol, stooq_symbol):
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
@@ -177,9 +173,9 @@ def fetch_macro_api(symbol, stooq_symbol):
     except Exception:
         pass
     try:
-        s_df = web.DataReader(stooq_symbol, 'stooq').head(2)
+        s_df = fetch_chart_stooq_csv(stooq_symbol)
         if not s_df.empty and len(s_df) >= 2:
-            p1, p2 = s_df['Close'].iloc[0], s_df['Close'].iloc[1]
+            p1, p2 = s_df['Close'].iloc[-1], s_df['Close'].iloc[-2]
             return p1, (p1 / p2 - 1)
     except Exception:
         pass
@@ -187,7 +183,7 @@ def fetch_macro_api(symbol, stooq_symbol):
 
 
 def get_live_quote(ticker_symbol):
-    """实时(尽力而为)现价与成交量,来自 yfinance 的 fast_info,比日线K线更贴近当前时刻。"""
+    """实时现价与成交量"""
     try:
         tk = yf.Ticker(ticker_symbol)
         fi = _throttled_yahoo_call(lambda: tk.fast_info)
@@ -199,19 +195,7 @@ def get_live_quote(ticker_symbol):
 
 
 def build_scenario_model(hist_df):
-    """
-    组合优化版"场景回归预测"模型(替换原来"单变量OLS + 固定±6%"的做法):
-
-    B. 分位数回归(Quantile Regression):直接对 High/Low 相对昨收的涨跌幅分别拟合
-       90%/50%/10% 三条分位数线,作为"乐观/中性/悲观"三个场景,天然带概率含义,
-       不再是"中性值 × 拍脑袋的固定百分比"。
-
-    A. 波动率自适应:把"近10日实际波动率"也作为回归自变量之一(而不是只用开盘跳空幅度),
-       这样区间会随这只股票当前的真实波动状态自动收窄/放宽,不再是所有股票、所有时期用同一套宽度。
-
-    小样本兜底:数据不够(新股/次新股历史太短)或分位数回归本身失败时,自动退回原来的
-    简单线性回归 + 固定百分比,保证页面不会因为模型失败而空白或崩溃。
-    """
+    """分位数回归 + 波动率自适应场景模型"""
     fit_df = hist_df.dropna().copy()
     if len(fit_df) < 15:
         return {'mode': 'insufficient'}
@@ -227,15 +211,6 @@ def build_scenario_model(hist_df):
     y_h = (fit_df['High'] / fit_df['昨收'] - 1).values
     y_l = (fit_df['Low'] / fit_df['昨收'] - 1).values
 
-    # 兜底方案的线性回归参数:不管最终用不用分位数回归,都先把这份算好、存进模型里。
-    # 这样即使分位数回归在"拟合时"是成功的,但"预测时"(用最新一行数据算特征)遇到NaN导致崩溃,
-    # 也有一份现成的兜底参数可以立刻切换,不会让整个页面报错。
-    X_simple = fit_df[['gap']].values
-    fallback = {}
-    for tag, y in [('h', y_h), ('l', y_l)]:
-        m = LinearRegression().fit(X_simple, y)
-        fallback[f's_{tag}'], fallback[f'i_{tag}'] = m.coef_[0], m.intercept_
-
     if len(fit_df) >= 25:
         try:
             from sklearn.linear_model import QuantileRegressor
@@ -243,19 +218,21 @@ def build_scenario_model(hist_df):
             quantile_map = {'乐观': 0.9, '中性': 0.5, '悲观': 0.1}
             models = {'h': {}, 'l': {}}
             for scene, q in quantile_map.items():
-                # alpha 是L1正则强度,样本量不大时加一点正则避免系数被少数点带偏
                 models['h'][scene] = QuantileRegressor(quantile=q, alpha=0.3, solver='highs').fit(X, y_h)
                 models['l'][scene] = QuantileRegressor(quantile=q, alpha=0.3, solver='highs').fit(X, y_l)
-            return {'mode': 'quantile', 'models': models, 'fallback_params': fallback}
+            return {'mode': 'quantile', 'models': models}
         except Exception:
-            pass  # 分位数回归失败(比如scipy版本太旧不支持highs求解器),落到下面的兜底
+            pass
 
-    # 兜底方案:样本不足或分位数回归失败,退回原来的简单线性回归 + 固定百分比
+    X_simple = fit_df[['gap']].values
+    fallback = {}
+    for tag, y in [('h', y_h), ('l', y_l)]:
+        m = LinearRegression().fit(X_simple, y)
+        fallback[f's_{tag}'], fallback[f'i_{tag}'] = m.coef_[0], m.intercept_
     return {'mode': 'linear_fallback', 'params': fallback}
 
 
 def predict_scenarios(scenario_model, hist_df):
-    """根据 build_scenario_model 产出的模型,结合最新一天数据,算出三档场景的压力/支撑参考价。"""
     if not scenario_model or scenario_model.get('mode') == 'insufficient':
         return None, 'insufficient'
 
@@ -265,63 +242,38 @@ def predict_scenarios(scenario_model, hist_df):
         return None, 'insufficient'
 
     gap = (last['Open'] - prev_close) / prev_close
-    if pd.isna(gap) or not np.isfinite(gap):
-        gap = 0.0  # 最新一行开盘价缺失时,当作"无跳空信息"处理,不让NaN往下传
 
-    def _linear_rows(params):
-        p_h = prev_close * (1 + (params['i_h'] + params['s_h'] * gap))
-        p_l = prev_close * (1 + (params['i_l'] + params['s_l'] * gap))
-        return [
+    if scenario_model['mode'] == 'quantile':
+        ret = hist_df['Close'].pct_change()
+        recent_vol = ret.rolling(10).std().iloc[-1]
+        if pd.isna(recent_vol):
+            recent_vol = ret.std()
+        X_pred = np.array([[gap, recent_vol]])
+        models = scenario_model['models']
+
+        h_vals = {scene: prev_close * (1 + models['h'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
+        l_vals = {scene: prev_close * (1 + models['l'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
+
+        h_sorted = sorted(h_vals.values(), reverse=True)
+        l_sorted = sorted(l_vals.values(), reverse=True)
+        rows = [(scene, h_sorted[i], l_sorted[i]) for i, scene in enumerate(['乐观', '中性', '悲观'])]
+        return rows, 'quantile'
+
+    if scenario_model['mode'] == 'linear_fallback':
+        p = scenario_model['params']
+        p_h = prev_close * (1 + (p['i_h'] + p['s_h'] * gap))
+        p_l = prev_close * (1 + (p['i_l'] + p['s_l'] * gap))
+        rows = [
             ('乐观', p_h * 1.06, p_l * 1.06),
             ('中性', p_h, p_l),
             ('悲观', p_h * 0.94, p_l * 0.94),
         ]
-
-    if scenario_model['mode'] == 'quantile':
-        # 分位数回归的预测特征来自"最新一行"数据,拟合时用的是历史数据(已经dropna过),
-        # 两者不是同一批行,预测时仍可能遇到NaN(比如当天数据还没走完、Open缺失)。
-        # 这里做完整的有效性校验,任何一步失败都优雅降级到线性兜底,而不是让sklearn直接报错崩溃。
-        try:
-            ret = hist_df['Close'].pct_change()
-            recent_vol = ret.rolling(10).std().iloc[-1]
-            if pd.isna(recent_vol):
-                recent_vol = ret.std()
-            if pd.isna(recent_vol) or not np.isfinite(recent_vol):
-                recent_vol = 0.0
-
-            X_pred = np.array([[gap, recent_vol]], dtype=float)
-            if not np.all(np.isfinite(X_pred)):
-                raise ValueError("预测特征包含无效值(NaN/Inf)")
-
-            models = scenario_model['models']
-            h_vals = {scene: prev_close * (1 + models['h'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
-            l_vals = {scene: prev_close * (1 + models['l'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
-
-            # 分位数回归在小样本下偶尔会出现"分位数交叉"(比如10%分位算出来比50%分位还高),
-            # 这里做一次排序兜底,保证"乐观>中性>悲观"这个顺序始终符合直觉。
-            h_sorted = sorted(h_vals.values(), reverse=True)
-            l_sorted = sorted(l_vals.values(), reverse=True)
-            rows = [(scene, h_sorted[i], l_sorted[i]) for i, scene in enumerate(['乐观', '中性', '悲观'])]
-            return rows, 'quantile'
-        except Exception:
-            fb = scenario_model.get('fallback_params')
-            if fb:
-                return _linear_rows(fb), 'linear_fallback'
-            return None, 'insufficient'
-
-    if scenario_model['mode'] == 'linear_fallback':
-        return _linear_rows(scenario_model['params']), 'linear_fallback'
+        return rows, 'linear_fallback'
 
     return None, 'insufficient'
 
 
 def estimate_iv_expected_move(ticker_symbol, current_price):
-    """
-    C. 期权隐含波动率(IV)交叉参考:
-    找最近一个到期日里,离现价最近的平值(ATM)看涨/看跌期权,取其IV,
-    按 sqrt(时间) 换算成"1个交易日等效"的预期波动幅度——这是期权市场对未来波动的定价,
-    跟上面纯历史统计的分位数回归是两套独立信息源,放在一起可以互相印证,而不是只信一个模型。
-    """
     try:
         exp_list = get_expiration_list(ticker_symbol)
         if not exp_list:
@@ -354,27 +306,20 @@ def estimate_iv_expected_move(ticker_symbol, current_price):
 
 
 def calculate_turnover_metrics(volume, capital, timestamp_unix):
-    """
-    换手率的实时值 + 盘中外推全天预估值。
-    修复点:原来的线性外推(全天量 = 已成交量 × 390/已交易分钟)假设"全天成交量匀速发生",
-    但实际开盘前15-30分钟成交量通常远高于全天均值(典型的U型分布)——如果开盘5分钟就外推,
-    会把"平时10%的量"直接放大成"全天78%"这种明显失真的数字。
-    这里加一道保护:开盘不满30分钟时,只给实时值,不做全天外推,并明确告知原因。
-    """
     if not capital or capital <= 0 or not volume or volume <= 0:
         return 0.0, 0.0, "数据不足"
 
     realtime_turnover = (volume / capital) * 100.0
 
     dt_utc = datetime.fromtimestamp(timestamp_unix, tz=timezone.utc)
-    dt_est = dt_utc.astimezone(timezone(timedelta(hours=-4)))  # 美东时间(不处理夏令时切换,仅作粗略盘中判断)
+    dt_est = dt_utc.astimezone(timezone(timedelta(hours=-4)))
 
     weekday = dt_est.weekday()
     time_min = dt_est.hour * 60 + dt_est.minute
     open_min = 9 * 60 + 30
     close_min = 16 * 60
     total_trade_min = 390
-    min_reliable_elapsed = 30  # 开盘不满30分钟,线性外推不可靠
+    min_reliable_elapsed = 30
 
     if weekday < 5 and open_min <= time_min <= close_min:
         elapsed = time_min - open_min
@@ -397,41 +342,31 @@ def do_fetch_stock_data(ticker_symbol):
         hist = pd.DataFrame()
         source = "Yahoo Finance"
 
+        # 1. 尝试主源 Yahoo
         try:
-            # K线这个主通道有 Stooq 这个完全独立的免费替代源做兜底,一旦失败就没必要死等重试
-            # (如果是IP被系统性限流,retry大概率还是失败,只会让用户多等几秒却什么都没换来)——
-            # 所以这里 max_retries=0,失败就立刻转向 Stooq,而不是先耗掉一次退避时间。
-            hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"), max_retries=0)
+            hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"))
         except Exception:
             hist = pd.DataFrame()
 
-        if hist.empty:
+        # 2. 备用：网络兜底 Stooq CSV 通道
+        if hist.empty or len(hist) < 2:
             try:
-                stooq_code = f"{ticker_symbol}.US" if "^" not in ticker_symbol and "." not in ticker_symbol else ticker_symbol
-                hist = web.DataReader(stooq_code, 'stooq').head(100).sort_index()
+                hist = fetch_chart_stooq_csv(ticker_symbol)
                 if not hist.empty:
-                    source = "Stooq (备用源)"
+                    source = "Stooq (网络兜底)"
             except Exception:
                 pass
 
-        if hist.empty:
+        if hist.empty or len(hist) < 2:
             return None
 
-        btc, _ = fetch_macro_api("BTC-USD", "BTCUSD")
-        nasdaq, nasdaq_pct = fetch_macro_api("^IXIC", "^NDQ")
-        vix, vix_pct = fetch_macro_api("^VIX", "^VIX")
+        btc, _ = fetch_macro_api("BTC-USD", "btc.us")
+        nasdaq, nasdaq_pct = fetch_macro_api("^IXIC", "^ndq")
+        vix, vix_pct = fetch_macro_api("^VIX", "^vix")
 
         current_float, float_label = get_effective_float(ticker_symbol)
 
         hist.index = pd.to_datetime(hist.index).date
-
-        # 修复"现价显示 $nan":Yahoo 在盘前/刚跨日时,有时会在最后一行返回"今天"的占位K线
-        # (OHLC 全是 NaN,因为当天还没开盘/没有真实成交)。直接拿这一行当"最新价"就会显示 nan。
-        # 丢弃末尾这类无效行,保证 hist.iloc[-1] 始终是一根有真实收盘价的K线。
-        hist = hist[hist['Close'].notna()]
-        if hist.empty:
-            return None
-
         hist['昨收'] = hist['Close'].shift(1)
         hist['MA5'] = hist['Close'].rolling(5).mean()
         hist['MA20'] = hist['Close'].rolling(20).mean()
@@ -468,28 +403,15 @@ def do_fetch_stock_data(ticker_symbol):
 
 
 # ==========================================
-# 🎯 5. 期权链(改用 yfinance 自带方法,不再手动拼 crumb/时间戳)
+# 🎯 5. 期权链模块
 # ==========================================
 def get_expiration_list(ticker_symbol):
-    """
-    到期日直接用 yfinance 的 tk.options,库内部已经处理好了和 Yahoo 的认证与日期映射,
-    不需要我们自己算时间戳——这正是之前"选的到期日A、实际拿到B"这个bug的根源,现在直接消失。
-    """
     tk = yf.Ticker(ticker_symbol)
     dates = _throttled_yahoo_call(lambda: list(tk.options))
     return dates
 
 
 def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_price):
-    """
-    三级智能降级模型(保留原有设计):OI 优先 -> 成交量 -> 行权价分布权重。
-    重构点:
-      1. 期权原始数据来自 yfinance 的 tk.option_chain(date),不再手写反爬请求。
-      2. 所有网络请求走全局节流器,失败(429)老实退避重试一次,不做任何绕过限制的操作。
-      3. 现价优先用 fast_info 的实时价,而不是可能滞后的日线收盘价。
-      4. IV 缺失/异常的行权价从 Gamma Flip 的数值积分里剔除,不再用固定值顶替(避免虚构数据)。
-      5. 明确的异常状态返回,区分"接口失败/被限流"和"这个到期日确实没有报价"。
-    """
     calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
     call_wall, put_wall, gamma_flip, pcr_value = np.nan, np.nan, np.nan, np.nan
     atm_iv, move_1d, move_exp = np.nan, np.nan, np.nan
@@ -516,11 +438,9 @@ def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_pri
                         df[col] = 0.0
                     else:
                         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
-                df['iv_valid'] = df['impliedVolatility'] > 0.01  # 无效IV直接从Gamma计算里剔除,不用固定值顶替
+                df['iv_valid'] = df['impliedVolatility'] > 0.01
                 df['density_weight'] = 1.0 / (1.0 + (df['strike'] - current_price).abs())
 
-        # 期权隐含波动率(IV)Expected Move:只用"有效IV"的合约里离现价最近的那张(ATM),
-        # 找不到有效IV就老实返回NaN,绝不拿固定值顶替——不然算出来的"预期波幅"是编的,不是市场真实定价。
         all_valid = pd.concat([
             calls[calls['iv_valid']] if not calls.empty else pd.DataFrame(),
             puts[puts['iv_valid']] if not puts.empty else pd.DataFrame(),
@@ -649,7 +569,7 @@ def background_updater_loop():
                         except Exception:
                             exp_list = []
 
-                        for exp_date in exp_list[:2]:  # 只预热最近两个到期日,减少总请求量
+                        for exp_date in exp_list[:2]:
                             try:
                                 opt_key = f"{ticker}_{exp_date}"
                                 opt_data = do_fetch_option_details(ticker, exp_date, last_price)
