@@ -21,6 +21,7 @@ st.set_page_config(layout="wide", page_title="专业量化决策终端")
 BEIJING_TZ = timezone(timedelta(hours=8))
 GLOBAL_RATE_INTERVAL = 1.0
 
+# 🎯 主流券商口径股本字典 (精准对齐富途/老虎/雪球)
 PRESET_FLOATS = {
     "BTDR": 123715025,
     "AAPL": 15200000000,
@@ -89,12 +90,12 @@ def load_us_stock_library():
 STOCK_LIBRARY = load_us_stock_library()
 
 # ==========================================
-# 📐 3. 股本数据与换手率计算
+# 📐 3. 股本数据与换手率计算 (去旧缓存硬核校准)
 # ==========================================
-@st.cache_data(ttl=86400)
 def get_share_stats(ticker_symbol):
+    # 🎯 取消 @st.cache_data 缓存穿透，强行优先使用 123,715,025 基准股本
     if ticker_symbol in PRESET_FLOATS:
-        return float(PRESET_FLOATS[ticker_symbol]), "基准股本(已校准)"
+        return float(PRESET_FLOATS[ticker_symbol]), "基准股本(已对齐券商)"
 
     info = {}
     try:
@@ -123,7 +124,7 @@ def get_effective_float(ticker_symbol):
     return get_share_stats(ticker_symbol)
 
 # ==========================================
-# 🚀 4. 8/17 最新交易日元数据强缝合抓取引擎
+# 🚀 4. 抗崩溃行情数据抓取引擎
 # ==========================================
 def fetch_chart_yahoo_direct(symbol):
     try:
@@ -136,7 +137,6 @@ def fetch_chart_yahoo_direct(symbol):
             timestamps = result.get('timestamp', [])
             quote = result['indicators']['quote'][0]
             
-            # 转为美东日期
             dt_index = pd.to_datetime(timestamps, unit='s', utc=True).tz_convert('America/New_York').date
             
             df = pd.DataFrame({
@@ -150,10 +150,9 @@ def fetch_chart_yahoo_direct(symbol):
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            # 清理纯空行
             df = df.dropna(how='all', subset=['Open', 'High', 'Low', 'Close']).copy()
             
-            # 🎯【核心元数据缝合】：强行校验并补齐 8/17 的最新交易日数据
+            # 元数据盘后缝合
             p_close = meta.get('regularMarketPrice')
             p_high = meta.get('regularMarketDayHigh', p_close)
             p_low = meta.get('regularMarketDayLow', p_close)
@@ -163,14 +162,12 @@ def fetch_chart_yahoo_direct(symbol):
             if m_time and p_close and p_close > 0:
                 m_date = datetime.fromtimestamp(m_time, tz=timezone.utc).astimezone(timezone(timedelta(hours=-4))).date()
                 
-                # 情况 A：如果 K 线数组尚未包含 8/17，直接拼接 8/17
                 if df.empty or df.index[-1] < m_date:
                     p_open = df['Close'].iloc[-1] if not df.empty else p_close
                     patch_row = pd.DataFrame({
                         'Open': [p_open], 'High': [p_high], 'Low': [p_low], 'Close': [p_close], 'Volume': [p_vol]
                     }, index=[m_date])
                     df = pd.concat([df, patch_row])
-                # 情况 B：如果已有 8/17 记录但价格为 NaN，用 meta 元数据补全
                 elif df.index[-1] == m_date:
                     if pd.isna(df.loc[m_date, 'Close']) or df.loc[m_date, 'Close'] == 0:
                         df.loc[m_date, 'Close'] = p_close
@@ -397,7 +394,7 @@ def do_fetch_stock_data(ticker_symbol):
         hist = pd.DataFrame()
         source = ""
 
-        # 1. 优先：TLS 伪装穿透 + 8/17 元数据自动补全缝合
+        # 1. 优先：伪造指纹抓取 + 自动缝合最新交易日
         hist, source = fetch_chart_yahoo_direct(ticker_symbol)
 
         # 2. 备用源
@@ -430,6 +427,8 @@ def do_fetch_stock_data(ticker_symbol):
         hist['MA20'] = hist['Close'].rolling(20).mean()
         std20 = hist['Close'].rolling(20).std().fillna(0)
         hist['Upper'], hist['Lower'] = hist['MA20'] + std20 * 2, hist['MA20'] - std20 * 2
+        
+        # 🎯 精准对齐全量 K 线换手率计算
         hist['换手率_raw'] = (hist['Volume'] / current_float) if (current_float and current_float > 0) else np.nan
 
         tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
@@ -722,7 +721,7 @@ with st.sidebar:
     manual_float = st.number_input(
         f"{st.session_state.current_ticker} 流通股手动修正",
         min_value=0, value=0, step=1000000,
-        help="如果你对这个标的流通股数量有更准确的数据源,可以在这里手动填入,留 0 则走自动获取。"
+        help="如果你对这个标的的流通股数量有更准确的数据源,可以在这里手动填入,留 0 则走自动获取。"
     )
     override_key = f"float_override_{st.session_state.current_ticker}"
     st.session_state[override_key] = manual_float if manual_float > 0 else None
