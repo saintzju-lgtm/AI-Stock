@@ -60,20 +60,14 @@ STOCK_LIBRARY = load_us_stock_library()
 # 🧮 3. 动态股本解析与换手率计算引擎
 # ==========================================
 def resolve_dynamic_share_capital(info, ticker_symbol):
-    """
-    动态解析自由流通股 (Free Float) 与 总股本 (Shares Outstanding)
-    带防拆股未同步/增发数据校正逻辑
-    """
     float_shares = info.get('floatShares') if info else None
     shares_out = info.get('sharesOutstanding') if info else None
     
-    # 转为数值
     float_shares = float(float_shares) if float_shares and float_shares > 0 else None
     shares_out = float(shares_out) if shares_out and shares_out > 0 else None
     
-    # 拆股/数据错配校正：若自由流通股 > 总股本，说明 API 拆股系数未调整，强制修正
     if float_shares and shares_out and float_shares > shares_out * 1.05:
-        float_shares = shares_out * 0.85 # 按常见自由流通比例回退
+        float_shares = shares_out * 0.85 
         
     if float_shares:
         capital = float_shares
@@ -88,23 +82,19 @@ def resolve_dynamic_share_capital(info, ticker_symbol):
     return capital, cap_type, float_shares, shares_out
 
 def calculate_turnover_metrics(volume, capital, timestamp_unix):
-    """
-    计算实时换手率 & 盘中外推预计全天换手率 (美东 09:30 - 16:00，共390分钟)
-    """
     if not capital or capital <= 0 or not volume or volume <= 0:
         return 0.0, 0.0, "数据不足"
         
     realtime_turnover = (volume / capital) * 100.0
     
-    # 转美东时间 (EDT / EST) 判断盘中进度
     dt_utc = datetime.fromtimestamp(timestamp_unix, tz=timezone.utc)
-    dt_est = dt_utc.astimezone(timezone(timedelta(hours=-4))) # 美东夏令时 EDT
+    dt_est = dt_utc.astimezone(timezone(timedelta(hours=-4))) 
     
     weekday = dt_est.weekday()
     time_min = dt_est.hour * 60 + dt_est.minute
-    open_min = 9 * 60 + 30   # 09:30
-    close_min = 16 * 60      # 16:00
-    total_trade_min = 390    # 6.5 小时
+    open_min = 9 * 60 + 30   
+    close_min = 16 * 60      
+    total_trade_min = 390    
     
     if weekday < 5 and open_min <= time_min <= close_min:
         elapsed = max(time_min - open_min, 1)
@@ -143,31 +133,35 @@ def fetch_macro_api(symbol, stooq_symbol):
     return 0.0, 0.0
 
 def do_fetch_stock_data(ticker_symbol):
+    """抓取股票与核心指标（增加防御性检测）"""
+    now_ts = time.time()
+    fetch_time_bj = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
+
+    hist = pd.DataFrame()
+    info = {}
+    source = "Yahoo Finance"
+    
+    # 1. 尝试主源 Yahoo
     try:
-        now_ts = time.time()
-        fetch_time_bj = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
-
+        tk = yf.Ticker(ticker_symbol)
+        hist = tk.history(period="100d", interval="1d")
+        try: info = tk.info
+        except Exception: info = {}
+    except Exception:
         hist = pd.DataFrame()
-        info = {}
-        source = "Yahoo Finance"
-        
+
+    # 2. 尝试备用源 Stooq
+    if hist.empty or len(hist) < 5:
         try:
-            tk = yf.Ticker(ticker_symbol)
-            hist = tk.history(period="100d", interval="1d")
-            try: info = tk.info
-            except Exception: info = {}
-        except Exception:
-            hist = pd.DataFrame()
+            stooq_code = f"{ticker_symbol}.US" if "^" not in ticker_symbol and "." not in ticker_symbol else ticker_symbol
+            hist = web.DataReader(stooq_code, 'stooq').head(100).sort_index()
+            if not hist.empty: source = "Stooq (备用源)"
+        except Exception: pass
 
-        if hist.empty:
-            try:
-                stooq_code = f"{ticker_symbol}.US" if "^" not in ticker_symbol and "." not in ticker_symbol else ticker_symbol
-                hist = web.DataReader(stooq_code, 'stooq').head(100).sort_index()
-                if not hist.empty: source = "Stooq (备用源)"
-            except Exception: pass
+    if hist.empty or len(hist) < 2:
+        return None
 
-        if hist.empty: return None
-
+    try:
         btc, _ = fetch_macro_api("BTC-USD", "BTCUSD")
         nasdaq, nasdaq_pct = fetch_macro_api("^IXIC", "^NDQ")
         vix, vix_pct = fetch_macro_api("^VIX", "^VIX")
@@ -177,17 +171,15 @@ def do_fetch_stock_data(ticker_symbol):
             try: exp_dates = list(yf.Ticker(ticker_symbol).options)
             except Exception: exp_dates = []
 
-        # 🎯 动态解算真实流通股本与总股本
         capital, cap_type, float_shares, shares_out = resolve_dynamic_share_capital(info, ticker_symbol)
 
         hist.index = pd.to_datetime(hist.index).date
         hist['昨收'] = hist['Close'].shift(1)
-        hist['MA5'] = hist['Close'].rolling(5).mean()
-        hist['MA20'] = hist['Close'].rolling(20).mean()
-        std20 = hist['Close'].rolling(20).std()
+        hist['MA5'] = hist['Close'].rolling(min_periods=1, window=5).mean()
+        hist['MA20'] = hist['Close'].rolling(min_periods=1, window=20).mean()
+        std20 = hist['Close'].rolling(min_periods=1, window=20).std().fillna(0)
         hist['Upper'], hist['Lower'] = hist['MA20'] + std20*2, hist['MA20'] - std20*2
         
-        # 历史 K 线换手率序列计算
         if capital and capital > 0:
             hist['换手率_raw'] = (hist['Volume'] / capital)
         else:
@@ -195,37 +187,44 @@ def do_fetch_stock_data(ticker_symbol):
         
         tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
         rmf = tp * hist['Volume']
-        mfr = pd.Series(np.where(tp > tp.shift(1), rmf, 0)).rolling(14).sum() / pd.Series(np.where(tp < tp.shift(1), rmf, 0)).rolling(14).sum()
-        hist['MFI'] = 100 - (100 / (1 + mfr.values))
+        mfr = pd.Series(np.where(tp > tp.shift(1), rmf, 0)).rolling(min_periods=1, window=14).sum() / pd.Series(np.where(tp < tp.shift(1), rmf, 0)).rolling(min_periods=1, window=14).sum().replace(0, 1)
+        hist['MFI'] = (100 - (100 / (1 + mfr.values))).fillna(50)
 
         avg_vol = hist['Volume'].mean()
         dark = hist[hist['Volume'] > avg_vol * 1.2].tail(8).copy()
-        dark['Signal'] = dark.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
+        if not dark.empty:
+            dark['Signal'] = dark.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
 
-        # 波动率自适应 + 残差分位数拟合
-        fit_df = hist.dropna().copy()
-        X = ((fit_df['Open'] - fit_df['昨收']) / fit_df['昨收']).values.reshape(-1, 1)
-        reg_params = {}
-
-        recent_vol = fit_df['Close'].pct_change().tail(20).std()
-        hist_vol = fit_df['Close'].pct_change().std()
-        vol_scale = (recent_vol / hist_vol) if (hist_vol > 0 and pd.notnull(recent_vol)) else 1.0
-        vol_scale = float(np.clip(vol_scale, 0.6, 1.8))
-
-        for tag, target in [('h', 'High'), ('l', 'Low')]:
-            y_real = fit_df[target].values / fit_df['昨收'].values - 1
-            m = LinearRegression().fit(X, y_real)
-            y_pred = m.predict(X)
-            residuals = y_real - y_pred
-            q10, q50, q90 = np.percentile(residuals, [10, 50, 90])
+        # -------------------------------------------------------------
+        # 🛡️ 防御性线性回归与残差拟合 (防止数据量少时崩塌)
+        # -------------------------------------------------------------
+        reg_params = {
+            's_h': 0.5, 'i_h': 0.02, 'q10_h': -0.01, 'q50_h': 0.0, 'q90_h': 0.02,
+            's_l': 0.5, 'i_l': -0.02, 'q10_l': -0.02, 'q50_l': 0.0, 'q90_l': 0.01,
+            'vol_scale': 1.0
+        }
+        
+        fit_df = hist.dropna(subset=['Open', 'High', 'Low', 'Close', '昨收']).copy()
+        if len(fit_df) >= 5:
+            X = ((fit_df['Open'] - fit_df['昨收']) / fit_df['昨收']).values.reshape(-1, 1)
             
-            reg_params[f's_{tag}'] = float(m.coef_[0])
-            reg_params[f'i_{tag}'] = float(m.intercept_)
-            reg_params[f'q10_{tag}'] = float(q10)
-            reg_params[f'q50_{tag}'] = float(q50)
-            reg_params[f'q90_{tag}'] = float(q90)
-            
-        reg_params['vol_scale'] = vol_scale
+            recent_vol = fit_df['Close'].pct_change().tail(20).std()
+            hist_vol = fit_df['Close'].pct_change().std()
+            vol_scale = (recent_vol / hist_vol) if (hist_vol > 0 and pd.notnull(recent_vol)) else 1.0
+            reg_params['vol_scale'] = float(np.clip(vol_scale, 0.6, 1.8))
+
+            for tag, target in [('h', 'High'), ('l', 'Low')]:
+                y_real = fit_df[target].values / fit_df['昨收'].values - 1
+                m = LinearRegression().fit(X, y_real)
+                y_pred = m.predict(X)
+                residuals = y_real - y_pred
+                q10, q50, q90 = np.percentile(residuals, [10, 50, 90])
+                
+                reg_params[f's_{tag}'] = float(m.coef_[0])
+                reg_params[f'i_{tag}'] = float(m.intercept_)
+                reg_params[f'q10_{tag}'] = float(q10)
+                reg_params[f'q50_{tag}'] = float(q50)
+                reg_params[f'q90_{tag}'] = float(q90)
 
         latest_vol = hist['Volume'].iloc[-1]
         rt_turnover, proj_turnover, trade_status = calculate_turnover_metrics(latest_vol, capital, now_ts)
@@ -472,7 +471,7 @@ if not stock_data or is_expired:
                 GLOBAL_STORE["active_queue"].add(ticker)
 
 if not stock_data:
-    st.error("⚠️ 当前股票数据拉取失败，可能是股票代码不匹配或数据源暂时中断。")
+    st.error(f"⚠️ {ticker} 股票数据拉取失败，请点击侧边栏重新切换或稍后再试。")
 else:
     hist_df, reg, dark_df, exp_dates, mkt = stock_data
     last = hist_df.iloc[-1]
@@ -487,14 +486,11 @@ else:
 
     st.divider()
     
-    # -------------------------------------------------------------
-    # 📊 换手率与场景回归看板 (动态外推与基准股本透明化)
-    # -------------------------------------------------------------
+    # 场景回归预测
     c1, c2 = st.columns([1, 1.5])
     with c1:
         st.subheader("📊 实时指标")
         
-        # 🎯 升级后的换手率展示
         if mkt['capital'] and mkt['capital'] > 0:
             cap_m = mkt['capital'] / 1e8 if mkt['capital'] >= 1e8 else mkt['capital'] / 1e4
             unit_str = "亿股" if mkt['capital'] >= 1e8 else "万股"
