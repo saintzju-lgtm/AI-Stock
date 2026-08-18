@@ -112,7 +112,6 @@ def get_share_stats(ticker_symbol):
     float_shares = float(float_shares) if float_shares and float_shares > 0 else None
     shares_out = float(shares_out) if shares_out and shares_out > 0 else None
 
-    # 兜底：若 API 被限流或返回空，自动启动预设股本保底
     if not float_shares and not shares_out and ticker_symbol in PRESET_FLOATS:
         return float(PRESET_FLOATS[ticker_symbol]), "预设股本(兜底)"
 
@@ -211,6 +210,13 @@ def build_scenario_model(hist_df):
     y_h = (fit_df['High'] / fit_df['昨收'] - 1).values
     y_l = (fit_df['Low'] / fit_df['昨收'] - 1).values
 
+    # 预先计算 OLS 兜底参数
+    X_simple = fit_df[['gap']].values
+    fallback = {}
+    for tag, y in [('h', y_h), ('l', y_l)]:
+        m = LinearRegression().fit(X_simple, y)
+        fallback[f's_{tag}'], fallback[f'i_{tag}'] = m.coef_[0], m.intercept_
+
     if len(fit_df) >= 25:
         try:
             from sklearn.linear_model import QuantileRegressor
@@ -220,19 +226,15 @@ def build_scenario_model(hist_df):
             for scene, q in quantile_map.items():
                 models['h'][scene] = QuantileRegressor(quantile=q, alpha=0.3, solver='highs').fit(X, y_h)
                 models['l'][scene] = QuantileRegressor(quantile=q, alpha=0.3, solver='highs').fit(X, y_l)
-            return {'mode': 'quantile', 'models': models}
+            return {'mode': 'quantile', 'models': models, 'params': fallback}
         except Exception:
             pass
 
-    X_simple = fit_df[['gap']].values
-    fallback = {}
-    for tag, y in [('h', y_h), ('l', y_l)]:
-        m = LinearRegression().fit(X_simple, y)
-        fallback[f's_{tag}'], fallback[f'i_{tag}'] = m.coef_[0], m.intercept_
     return {'mode': 'linear_fallback', 'params': fallback}
 
 
 def predict_scenarios(scenario_model, hist_df):
+    """预测场景参考价 (增加 NaN / Inf 防护)"""
     if not scenario_model or scenario_model.get('mode') == 'insufficient':
         return None, 'insufficient'
 
@@ -241,25 +243,36 @@ def predict_scenarios(scenario_model, hist_df):
     if pd.isna(prev_close) or prev_close <= 0:
         return None, 'insufficient'
 
-    gap = (last['Open'] - prev_close) / prev_close
+    # 安全计算 gap
+    open_p = last['Open'] if pd.notnull(last['Open']) else prev_close
+    gap = (open_p - prev_close) / prev_close
+    if pd.isna(gap) or np.isinf(gap):
+        gap = 0.0
 
     if scenario_model['mode'] == 'quantile':
-        ret = hist_df['Close'].pct_change()
-        recent_vol = ret.rolling(10).std().iloc[-1]
-        if pd.isna(recent_vol):
-            recent_vol = ret.std()
-        X_pred = np.array([[gap, recent_vol]])
-        models = scenario_model['models']
+        try:
+            ret = hist_df['Close'].pct_change()
+            recent_vol = ret.rolling(10).std().iloc[-1]
+            if pd.isna(recent_vol) or np.isinf(recent_vol):
+                recent_vol = ret.std()
+            if pd.isna(recent_vol) or np.isinf(recent_vol):
+                recent_vol = 0.01  # 极限兜底默认值
 
-        h_vals = {scene: prev_close * (1 + models['h'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
-        l_vals = {scene: prev_close * (1 + models['l'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
+            X_pred = np.array([[float(gap), float(recent_vol)]])
+            models = scenario_model['models']
 
-        h_sorted = sorted(h_vals.values(), reverse=True)
-        l_sorted = sorted(l_vals.values(), reverse=True)
-        rows = [(scene, h_sorted[i], l_sorted[i]) for i, scene in enumerate(['乐观', '中性', '悲观'])]
-        return rows, 'quantile'
+            h_vals = {scene: prev_close * (1 + models['h'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
+            l_vals = {scene: prev_close * (1 + models['l'][scene].predict(X_pred)[0]) for scene in ['乐观', '中性', '悲观']}
 
-    if scenario_model['mode'] == 'linear_fallback':
+            h_sorted = sorted(h_vals.values(), reverse=True)
+            l_sorted = sorted(l_vals.values(), reverse=True)
+            rows = [(scene, h_sorted[i], l_sorted[i]) for i, scene in enumerate(['乐观', '中性', '悲观'])]
+            return rows, 'quantile'
+        except Exception:
+            # 若分位数预测过程抛错，优雅退回简单线性回归
+            pass
+
+    if scenario_model.get('params'):
         p = scenario_model['params']
         p_h = prev_close * (1 + (p['i_h'] + p['s_h'] * gap))
         p_l = prev_close * (1 + (p['i_l'] + p['s_l'] * gap))
