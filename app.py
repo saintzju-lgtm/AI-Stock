@@ -102,16 +102,45 @@ def get_share_stats(ticker_symbol):
         直接用总股本封顶,不用任何拍脑袋的百分比去"修正"(那种修正本身没有数据依据,
         对本来流通股就接近100%总股本的公司反而会引入新的错误)。
     """
+    float_shares = None
+    shares_out = None
+
+    # 第一优先级:fast_info —— 轻量级报价接口,不需要走 info 那套容易失败的 crumb/多模块聚合请求。
+    # 实测中 info 经常因为 Yahoo 反爬策略变化返回空字典(不报错,只是啥都没有),
+    # 但 fast_info 通常还能拿到股本数据,是更稳的第一手来源。
+    try:
+        fi = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).fast_info)
+        fi_shares = fi.get('shares') if fi else None
+        if fi_shares and fi_shares > 0:
+            shares_out = float(fi_shares)
+    except Exception:
+        pass
+
+    # 第二优先级:get_shares_full —— 专门的股本历史接口,同样比 info 轻量,失败概率更低。
+    if not shares_out:
+        try:
+            shares_series = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).get_shares_full(start="2020-01-01"))
+            if shares_series is not None and len(shares_series) > 0:
+                last_val = shares_series.dropna().iloc[-1] if hasattr(shares_series, "dropna") else None
+                if last_val and last_val > 0:
+                    shares_out = float(last_val)
+        except Exception:
+            pass
+
+    # 第三优先级:info —— 最容易被限流/因 crumb 失效返回空字典,但只有它能给"流通股(floatShares)"
+    # 这个更精确的口径,所以仍然尝试,只是不再把它当成唯一数据源。
     try:
         info = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).info)
     except Exception:
         info = {}
 
-    float_shares = info.get('floatShares')
-    shares_out = info.get('sharesOutstanding')
+    info_float = info.get('floatShares')
+    info_out = info.get('sharesOutstanding')
 
-    float_shares = float(float_shares) if float_shares and float_shares > 0 else None
-    shares_out = float(shares_out) if shares_out and shares_out > 0 else None
+    if info_float and info_float > 0:
+        float_shares = float(info_float)
+    if not shares_out and info_out and info_out > 0:
+        shares_out = float(info_out)
 
     if float_shares and shares_out and float_shares > shares_out:
         float_shares = shares_out  # 逻辑封顶,不做无依据的百分比修正
@@ -395,6 +424,14 @@ def do_fetch_stock_data(ticker_symbol):
         current_float, float_label = get_effective_float(ticker_symbol)
 
         hist.index = pd.to_datetime(hist.index).date
+
+        # 修复"现价显示 $nan":Yahoo 在盘前/刚跨日时,有时会在最后一行返回"今天"的占位K线
+        # (OHLC 全是 NaN,因为当天还没开盘/没有真实成交)。直接拿这一行当"最新价"就会显示 nan。
+        # 丢弃末尾这类无效行,保证 hist.iloc[-1] 始终是一根有真实收盘价的K线。
+        hist = hist[hist['Close'].notna()]
+        if hist.empty:
+            return None
+
         hist['昨收'] = hist['Close'].shift(1)
         hist['MA5'] = hist['Close'].rolling(5).mean()
         hist['MA20'] = hist['Close'].rolling(20).mean()
