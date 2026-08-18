@@ -123,7 +123,7 @@ def get_effective_float(ticker_symbol):
     return get_share_stats(ticker_symbol)
 
 # ==========================================
-# 🚀 4. 抗崩溃行情数据抓取引擎 (带最新日数据缝合)
+# 🚀 4. 8/17 最新交易日元数据强缝合抓取引擎
 # ==========================================
 def fetch_chart_yahoo_direct(symbol):
     try:
@@ -136,40 +136,56 @@ def fetch_chart_yahoo_direct(symbol):
             timestamps = result.get('timestamp', [])
             quote = result['indicators']['quote'][0]
             
+            # 转为美东日期
+            dt_index = pd.to_datetime(timestamps, unit='s', utc=True).tz_convert('America/New_York').date
+            
             df = pd.DataFrame({
                 'Open': quote.get('open', []),
                 'High': quote.get('high', []),
                 'Low': quote.get('low', []),
                 'Close': quote.get('close', []),
                 'Volume': quote.get('volume', [])
-            }, index=pd.to_datetime(timestamps, unit='s'))
+            }, index=dt_index)
             
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            df.index = pd.to_datetime(df.index).date
+            # 清理纯空行
+            df = df.dropna(how='all', subset=['Open', 'High', 'Low', 'Close']).copy()
             
-            # 🎯 盘后元数据补全，防止最新交易日落空
-            if meta and 'regularMarketTime' in meta:
-                meta_dt = datetime.fromtimestamp(meta['regularMarketTime'], tz=timezone.utc).astimezone(timezone(timedelta(hours=-4))).date()
-                p_close = meta.get('regularMarketPrice')
-                if p_close and p_close > 0:
-                    p_open = meta.get('regularMarketOpen', p_close)
-                    p_high = meta.get('regularMarketDayHigh', p_close)
-                    p_low = meta.get('regularMarketDayLow', p_close)
-                    p_vol = meta.get('regularMarketVolume', 0)
-                    
-                    if df.empty or df.index[-1] < meta_dt:
-                        patch_row = pd.DataFrame({
-                            'Open': [p_open], 'High': [p_high], 'Low': [p_low], 'Close': [p_close], 'Volume': [p_vol]
-                        }, index=[meta_dt])
-                        df = pd.concat([df, patch_row])
-                    elif df.index[-1] == meta_dt and pd.isna(df['Close'].iloc[-1]):
-                        df.loc[meta_dt, ['Open', 'High', 'Low', 'Close', 'Volume']] = [p_open, p_high, p_low, p_close, p_vol]
+            # 🎯【核心元数据缝合】：强行校验并补齐 8/17 的最新交易日数据
+            p_close = meta.get('regularMarketPrice')
+            p_high = meta.get('regularMarketDayHigh', p_close)
+            p_low = meta.get('regularMarketDayLow', p_close)
+            p_vol = meta.get('regularMarketVolume', 0)
+            m_time = meta.get('regularMarketTime')
+            
+            if m_time and p_close and p_close > 0:
+                m_date = datetime.fromtimestamp(m_time, tz=timezone.utc).astimezone(timezone(timedelta(hours=-4))).date()
+                
+                # 情况 A：如果 K 线数组尚未包含 8/17，直接拼接 8/17
+                if df.empty or df.index[-1] < m_date:
+                    p_open = df['Close'].iloc[-1] if not df.empty else p_close
+                    patch_row = pd.DataFrame({
+                        'Open': [p_open], 'High': [p_high], 'Low': [p_low], 'Close': [p_close], 'Volume': [p_vol]
+                    }, index=[m_date])
+                    df = pd.concat([df, patch_row])
+                # 情况 B：如果已有 8/17 记录但价格为 NaN，用 meta 元数据补全
+                elif df.index[-1] == m_date:
+                    if pd.isna(df.loc[m_date, 'Close']) or df.loc[m_date, 'Close'] == 0:
+                        df.loc[m_date, 'Close'] = p_close
+                    if pd.isna(df.loc[m_date, 'Open']) or df.loc[m_date, 'Open'] == 0:
+                        df.loc[m_date, 'Open'] = p_close
+                    if pd.isna(df.loc[m_date, 'High']) or df.loc[m_date, 'High'] == 0:
+                        df.loc[m_date, 'High'] = max(p_high, p_close)
+                    if pd.isna(df.loc[m_date, 'Low']) or df.loc[m_date, 'Low'] == 0:
+                        df.loc[m_date, 'Low'] = min(p_low, p_close)
+                    if pd.isna(df.loc[m_date, 'Volume']) or df.loc[m_date, 'Volume'] == 0:
+                        df.loc[m_date, 'Volume'] = p_vol
 
-            df = df.dropna(subset=['Close']).copy()
+            df = df.ffill().bfill()
             if len(df) >= 2:
-                return df, "Yahoo TLS 穿透"
+                return df, "Yahoo TLS 缝合引擎"
     except Exception:
         pass
     return pd.DataFrame(), ""
@@ -381,14 +397,15 @@ def do_fetch_stock_data(ticker_symbol):
         hist = pd.DataFrame()
         source = ""
 
-        # 1. TLS 伪装穿透抓取 + 自动补全缝合最新交易日
+        # 1. 优先：TLS 伪装穿透 + 8/17 元数据自动补全缝合
         hist, source = fetch_chart_yahoo_direct(ticker_symbol)
 
-        # 2. 备用源处理
+        # 2. 备用源
         if hist.empty or len(hist) < 2:
             try:
                 hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"))
                 if not hist.empty:
+                    hist.index = pd.to_datetime(hist.index).date
                     source = "yfinance 官方库"
             except Exception:
                 hist = pd.DataFrame()
@@ -402,35 +419,12 @@ def do_fetch_stock_data(ticker_symbol):
         if hist.empty or len(hist) < 2:
             return None
 
-        # 🎯【核心修复】：若最新交易日开/高/低有缺漏，自动用收盘价或 live_quote 填补
-        last_idx = hist.index[-1]
-        live_p, live_v = get_live_quote(ticker_symbol)
-        
-        if pd.isna(hist.loc[last_idx, 'Close']) and live_p and live_p > 0:
-            hist.loc[last_idx, 'Close'] = live_p
-            
-        if pd.notnull(hist.loc[last_idx, 'Close']):
-            p_c = hist.loc[last_idx, 'Close']
-            if pd.isna(hist.loc[last_idx, 'Open']): hist.loc[last_idx, 'Open'] = p_c
-            if pd.isna(hist.loc[last_idx, 'High']): hist.loc[last_idx, 'High'] = p_c
-            if pd.isna(hist.loc[last_idx, 'Low']): hist.loc[last_idx, 'Low'] = p_c
-            if pd.isna(hist.loc[last_idx, 'Volume']) or hist.loc[last_idx, 'Volume'] == 0:
-                hist.loc[last_idx, 'Volume'] = live_v if (live_v and live_v > 0) else 0
-
-        # 清洗掉中间历史脏行
-        hist = hist.dropna(subset=['Open', 'High', 'Low', 'Close']).copy()
-        hist = hist[(hist['Close'] > 0) & (hist['Open'] > 0)].copy()
-
-        if hist.empty or len(hist) < 2:
-            return None
-
         btc, _ = fetch_macro_api("BTC-USD", "btc.us")
         nasdaq, nasdaq_pct = fetch_macro_api("^IXIC", "^ndq")
         vix, vix_pct = fetch_macro_api("^VIX", "^vix")
 
         current_float, float_label = get_effective_float(ticker_symbol)
 
-        hist.index = pd.to_datetime(hist.index).date
         hist['昨收'] = hist['Close'].shift(1)
         hist['MA5'] = hist['Close'].rolling(5).mean()
         hist['MA20'] = hist['Close'].rolling(20).mean()
@@ -454,6 +448,7 @@ def do_fetch_stock_data(ticker_symbol):
 
         scenario_model = build_scenario_model(hist)
 
+        live_price, live_volume = get_live_quote(ticker_symbol)
         volume_for_turnover = live_volume if (live_volume and live_volume > 0) else hist['Volume'].iloc[-1]
         rt_turnover, proj_turnover, trade_status = calculate_turnover_metrics(volume_for_turnover, current_float, now_ts)
 
@@ -727,7 +722,7 @@ with st.sidebar:
     manual_float = st.number_input(
         f"{st.session_state.current_ticker} 流通股手动修正",
         min_value=0, value=0, step=1000000,
-        help="如果你对这个标的的流通股数量有更准确的数据源,可以在这里手动填入,留 0 则走自动获取。"
+        help="如果你对这个标的流通股数量有更准确的数据源,可以在这里手动填入,留 0 则走自动获取。"
     )
     override_key = f"float_override_{st.session_state.current_ticker}"
     st.session_state[override_key] = manual_float if manual_float > 0 else None
