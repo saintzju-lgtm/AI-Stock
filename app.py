@@ -19,6 +19,16 @@ st.set_page_config(layout="wide", page_title="专业量化决策终端")
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
+PRESET_FLOATS = {
+    "BTDR": 123715025,
+    "AAPL": 15200000000,
+    "TSLA": 3180000000,
+    "NVDA": 24500000000,
+    "MSFT": 7430000000,
+    "GOOG": 12300000000,
+    "QQQ": 600000000
+}
+
 # ==========================================
 # 🧠 1. 全局解耦内存存储中心
 # ==========================================
@@ -66,6 +76,9 @@ def resolve_dynamic_share_capital(info, ticker_symbol):
     float_shares = float(float_shares) if float_shares and float_shares > 0 else None
     shares_out = float(shares_out) if shares_out and shares_out > 0 else None
     
+    if not float_shares and ticker_symbol in PRESET_FLOATS:
+        float_shares = PRESET_FLOATS[ticker_symbol]
+
     if float_shares and shares_out and float_shares > shares_out * 1.05:
         float_shares = shares_out * 0.85 
         
@@ -111,12 +124,40 @@ def calculate_turnover_metrics(volume, capital, timestamp_unix):
     return realtime_turnover, projected_turnover, status_str
 
 # ==========================================
-# 🚀 4. 抗崩溃数据抓取引擎
+# 🚀 4. TLS 指纹伪造网络抓取引擎 (curl_cffi)
 # ==========================================
-def fetch_macro_api(symbol, stooq_symbol):
+def fetch_chart_via_cffi(symbol):
+    """使用 Chrome 110 TLS 指纹抓取 Yahoo Chart 100日 K线数据"""
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        session = cffi_requests.Session(impersonate="chrome110")
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range=120d&interval=1d&includePrePost=false"
+        res = session.get(url, timeout=6)
+        if res.status_code == 200:
+            result = res.json()['chart']['result'][0]
+            timestamps = result.get('timestamp', [])
+            quote = result['indicators']['quote'][0]
+            
+            df = pd.DataFrame({
+                'Open': quote.get('open', []),
+                'High': quote.get('high', []),
+                'Low': quote.get('low', []),
+                'Close': quote.get('close', []),
+                'Volume': quote.get('volume', [])
+            }, index=pd.to_datetime(timestamps, unit='s'))
+            
+            df = df.dropna(subset=['Close']).copy()
+            if not df.empty:
+                return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def fetch_macro_api(symbol, stooq_symbol):
+    """宏观数据双源（带 curl_cffi 绕过 WAF）"""
+    try:
+        session = cffi_requests.Session(impersonate="chrome110")
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
+        res = session.get(url, timeout=4)
         if res.status_code == 200:
             meta = res.json()['chart']['result'][0]['meta']
             price = meta.get('regularMarketPrice', 0.0)
@@ -133,24 +174,36 @@ def fetch_macro_api(symbol, stooq_symbol):
     return 0.0, 0.0
 
 def do_fetch_stock_data(ticker_symbol):
-    """抓取股票与核心指标（增加防御性检测）"""
+    """三级穿透抓取：cffi原生 -> yfinance库 -> Stooq库"""
     now_ts = time.time()
     fetch_time_bj = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
     hist = pd.DataFrame()
     info = {}
-    source = "Yahoo Finance"
+    source = "Yahoo Finance (cffi穿透)"
     
-    # 1. 尝试主源 Yahoo
-    try:
-        tk = yf.Ticker(ticker_symbol)
-        hist = tk.history(period="100d", interval="1d")
-        try: info = tk.info
-        except Exception: info = {}
-    except Exception:
-        hist = pd.DataFrame()
+    # 1. 优先：cffi 伪造指纹抓取
+    hist = fetch_chart_via_cffi(ticker_symbol)
+    
+    # 获取 info 股本信息
+    if not hist.empty:
+        try:
+            tk = yf.Ticker(ticker_symbol)
+            try: info = tk.info
+            except Exception: info = {}
+        except Exception: pass
 
-    # 2. 尝试备用源 Stooq
+    # 2. 备用：标准 yfinance 库
+    if hist.empty:
+        try:
+            tk = yf.Ticker(ticker_symbol)
+            hist = tk.history(period="100d", interval="1d")
+            source = "Yahoo Finance (yfinance)"
+            try: info = tk.info
+            except Exception: info = {}
+        except Exception: pass
+
+    # 3. 兜底：Stooq
     if hist.empty or len(hist) < 5:
         try:
             stooq_code = f"{ticker_symbol}.US" if "^" not in ticker_symbol and "." not in ticker_symbol else ticker_symbol
@@ -167,9 +220,8 @@ def do_fetch_stock_data(ticker_symbol):
         vix, vix_pct = fetch_macro_api("^VIX", "^VIX")
 
         exp_dates = []
-        if source == "Yahoo Finance":
-            try: exp_dates = list(yf.Ticker(ticker_symbol).options)
-            except Exception: exp_dates = []
+        try: exp_dates = list(yf.Ticker(ticker_symbol).options)
+        except Exception: exp_dates = []
 
         capital, cap_type, float_shares, shares_out = resolve_dynamic_share_capital(info, ticker_symbol)
 
@@ -195,9 +247,6 @@ def do_fetch_stock_data(ticker_symbol):
         if not dark.empty:
             dark['Signal'] = dark.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
 
-        # -------------------------------------------------------------
-        # 🛡️ 防御性线性回归与残差拟合 (防止数据量少时崩塌)
-        # -------------------------------------------------------------
         reg_params = {
             's_h': 0.5, 'i_h': 0.02, 'q10_h': -0.01, 'q50_h': 0.0, 'q90_h': 0.02,
             's_l': 0.5, 'i_l': -0.02, 'q10_l': -0.02, 'q50_l': 0.0, 'q90_l': 0.01,
