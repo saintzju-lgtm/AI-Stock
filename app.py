@@ -190,6 +190,20 @@ def fetch_macro_api(symbol, stooq_symbol):
     except Exception: pass
     return 0.0, 0.0
 
+def fetch_option_dates_via_cffi(ticker_symbol):
+    """🎯 伪造指纹抓取期权到期日列表，解决 exp_dates 为空问题"""
+    try:
+        session = cffi_requests.Session(impersonate="chrome110")
+        session.get("https://fc.yahoo.com", timeout=4)
+        crumb = session.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=4).text.strip()
+        url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker_symbol}?crumb={crumb}"
+        res = session.get(url, timeout=5)
+        if res.status_code == 200:
+            timestamps = res.json()['optionChain']['result'][0].get('expirationDates', [])
+            return [datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d') for ts in timestamps]
+    except Exception: pass
+    return []
+
 def do_fetch_stock_data(ticker_symbol):
     now_ts = time.time()
     fetch_time_bj = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
@@ -227,12 +241,14 @@ def do_fetch_stock_data(ticker_symbol):
         nasdaq, nasdaq_pct = fetch_macro_api("^IXIC", "^ndq")
         vix, vix_pct = fetch_macro_api("^VIX", "^vix")
 
-        exp_dates = []
-        try:
-            tk_opt = yf.Ticker(ticker_symbol)
-            exp_dates = list(tk_opt.options)
-        except Exception:
-            exp_dates = []
+        # 🎯 优先使用 cffi 抓取期权到期日
+        exp_dates = fetch_option_dates_via_cffi(ticker_symbol)
+        if not exp_dates:
+            try:
+                tk_opt = yf.Ticker(ticker_symbol)
+                exp_dates = list(tk_opt.options)
+            except Exception:
+                exp_dates = []
 
         capital, cap_type, float_shares, shares_out = resolve_dynamic_share_capital(info, ticker_symbol)
 
@@ -251,8 +267,6 @@ def do_fetch_stock_data(ticker_symbol):
         tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
         rmf = tp * hist['Volume']
         mfr = pd.Series(np.where(tp > tp.shift(1), rmf, 0)).rolling(min_periods=1, window=14).sum() / pd.Series(np.where(tp < tp.shift(1), rmf, 0)).rolling(min_periods=1, window=14).sum().replace(0, 1)
-        
-        # 🛠️ 关键修复：保持 mfr 为 Pandas Series 参与计算，允许正确使用 .fillna(50)
         hist['MFI'] = (100 - (100 / (1 + mfr))).fillna(50)
 
         avg_vol = hist['Volume'].mean()
