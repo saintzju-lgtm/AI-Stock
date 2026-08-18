@@ -127,7 +127,6 @@ def calculate_turnover_metrics(volume, capital, timestamp_unix):
 # 🚀 4. 四级多源抗封锁抓取引擎
 # ==========================================
 def fetch_chart_yahoo_direct(symbol):
-    """源1：Yahoo Chart 官方原生 API 直连"""
     for domain in ["query2.finance.yahoo.com", "query1.finance.yahoo.com"]:
         try:
             url = f"https://{domain}/v8/finance/chart/{symbol}?range=120d&interval=1d&includePrePost=false"
@@ -154,7 +153,6 @@ def fetch_chart_yahoo_direct(symbol):
     return pd.DataFrame(), ""
 
 def fetch_chart_stooq_csv(symbol):
-    """源2：Stooq 官方 CSV 物理通道 (100% 不会被封)"""
     try:
         clean_sym = symbol.lower().split('.')[0].replace('^', '')
         stooq_sym = f"{clean_sym}.us" if not symbol.startswith('^') and '-USD' not in symbol else clean_sym
@@ -174,7 +172,6 @@ def fetch_chart_stooq_csv(symbol):
     return pd.DataFrame(), ""
 
 def fetch_macro_api(symbol, stooq_symbol):
-    """宏观指标抓取"""
     try:
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
         res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
@@ -194,7 +191,6 @@ def fetch_macro_api(symbol, stooq_symbol):
     return 0.0, 0.0
 
 def do_fetch_stock_data(ticker_symbol):
-    """带四级多源防御的股票数据抓取核心"""
     now_ts = time.time()
     fetch_time_bj = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
@@ -202,14 +198,11 @@ def do_fetch_stock_data(ticker_symbol):
     source = ""
     err_log = []
 
-    # 1. 尝试 Yahoo Direct API
     hist, source = fetch_chart_yahoo_direct(ticker_symbol)
     
-    # 2. 尝试 Stooq CSV 物理直连通道
     if hist.empty:
         hist, source = fetch_chart_stooq_csv(ticker_symbol)
         
-    # 3. 尝试 yfinance 库抓取
     if hist.empty:
         try:
             tk = yf.Ticker(ticker_symbol)
@@ -223,7 +216,6 @@ def do_fetch_stock_data(ticker_symbol):
         return None, f"数据源访问均失败 ({'; '.join(err_log) if err_log else '云端网络拦截'})"
 
     try:
-        # 获取 info (隔离保护)
         info = {}
         try:
             tk = yf.Ticker(ticker_symbol)
@@ -259,7 +251,9 @@ def do_fetch_stock_data(ticker_symbol):
         tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
         rmf = tp * hist['Volume']
         mfr = pd.Series(np.where(tp > tp.shift(1), rmf, 0)).rolling(min_periods=1, window=14).sum() / pd.Series(np.where(tp < tp.shift(1), rmf, 0)).rolling(min_periods=1, window=14).sum().replace(0, 1)
-        hist['MFI'] = (100 - (100 / (1 + mfr.values))).fillna(50)
+        
+        # 🛠️ 关键修复：保持 mfr 为 Pandas Series 参与计算，允许正确使用 .fillna(50)
+        hist['MFI'] = (100 - (100 / (1 + mfr))).fillna(50)
 
         avg_vol = hist['Volume'].mean()
         dark = hist[hist['Volume'] > avg_vol * 1.2].tail(8).copy()
@@ -555,7 +549,6 @@ else:
 
     st.divider()
     
-    # 场景回归预测
     c1, c2 = st.columns([1, 1.5])
     with c1:
         st.subheader("📊 实时指标")
