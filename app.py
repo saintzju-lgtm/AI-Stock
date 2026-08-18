@@ -11,6 +11,7 @@ import threading
 import requests
 from io import StringIO
 import pandas_datareader.data as web
+from curl_cffi import requests as cffi_requests
 
 # ==========================================
 # 0. 页面全局配置与时区定义
@@ -18,11 +19,8 @@ import pandas_datareader.data as web
 st.set_page_config(layout="wide", page_title="专业量化决策终端")
 
 BEIJING_TZ = timezone(timedelta(hours=8))
+GLOBAL_RATE_INTERVAL = 1.0
 
-# 全局最小请求间隔(秒)
-GLOBAL_RATE_INTERVAL = 1.5
-
-# 预设股本兜底字典 (当 API 接口在云端被封锁/超时拿不到 info 时自动启动)
 PRESET_FLOATS = {
     "BTDR": 123715025,
     "AAPL": 15200000000,
@@ -40,7 +38,7 @@ PRESET_FLOATS = {
 def get_global_data_store():
     return {
         "stock_cache": {},
-        "options_cache": {},      # key: f"{ticker}_{expiration}" -> option result tuple
+        "options_cache": {},
         "fetch_timestamps": {},
         "active_queue": set(["BTDR", "AAPL", "TSLA", "NVDA"]),
         "lock": threading.Lock(),
@@ -49,11 +47,7 @@ def get_global_data_store():
 
 GLOBAL_STORE = get_global_data_store()
 
-
 def _throttled_yahoo_call(func, max_retries=1):
-    """
-    网络请求统一全局节流控制
-    """
     last_err = None
     for attempt in range(max_retries + 1):
         with GLOBAL_STORE["lock"]:
@@ -67,11 +61,10 @@ def _throttled_yahoo_call(func, max_retries=1):
             last_err = e
             msg = str(e)
             if ("429" in msg or "Too Many Requests" in msg) and attempt < max_retries:
-                time.sleep(8 + attempt * 7)
+                time.sleep(5 + attempt * 5)
                 continue
             raise
     raise last_err
-
 
 # ==========================================
 # 🔍 2. 动态加载全量美股库
@@ -96,7 +89,7 @@ def load_us_stock_library():
 STOCK_LIBRARY = load_us_stock_library()
 
 # ==========================================
-# 📐 3. 股本数据(换手率分母 + 双重兜底)
+# 📐 3. 股本数据与换手率计算
 # ==========================================
 @st.cache_data(ttl=86400)
 def get_share_stats(ticker_symbol):
@@ -116,7 +109,7 @@ def get_share_stats(ticker_symbol):
         return float(PRESET_FLOATS[ticker_symbol]), "预设股本(兜底)"
 
     if float_shares and shares_out and float_shares > shares_out:
-        float_shares = shares_out  # 逻辑封顶
+        float_shares = shares_out
 
     if float_shares:
         return float_shares, "流通股(Float)"
@@ -125,21 +118,17 @@ def get_share_stats(ticker_symbol):
         
     return None, "无股本数据"
 
-
 def get_effective_float(ticker_symbol):
-    """支持侧边栏手动修正"""
     override_key = f"float_override_{ticker_symbol}"
     override_val = st.session_state.get(override_key)
     if override_val and override_val > 0:
         return float(override_val), "手动修正"
     return get_share_stats(ticker_symbol)
 
-
 # ==========================================
 # 🚀 4. 抗崩溃行情数据抓取引擎
 # ==========================================
 def fetch_chart_stooq_csv(symbol):
-    """Stooq 物理 CSV 通道 (网络兜底)"""
     try:
         clean_sym = symbol.lower().split('.')[0].replace('^', '')
         stooq_sym = f"{clean_sym}.us" if not symbol.startswith('^') and '-USD' not in symbol else clean_sym
@@ -151,13 +140,12 @@ def fetch_chart_stooq_csv(symbol):
             df.columns = [c.capitalize() for c in df.columns]
             df['Date'] = pd.to_datetime(df['Date'])
             df = df.set_index('Date').sort_index()
-            df = df.dropna(subset=['Close']).copy()
+            df = df.dropna(subset=['Close', 'Open', 'High', 'Low']).copy()
             if len(df) >= 2:
                 return df
     except Exception:
         pass
     return pd.DataFrame()
-
 
 def fetch_macro_api(symbol, stooq_symbol):
     try:
@@ -180,9 +168,7 @@ def fetch_macro_api(symbol, stooq_symbol):
         pass
     return 0.0, 0.0
 
-
 def get_live_quote(ticker_symbol):
-    """实时现价与成交量"""
     try:
         tk = yf.Ticker(ticker_symbol)
         fi = _throttled_yahoo_call(lambda: tk.fast_info)
@@ -192,10 +178,8 @@ def get_live_quote(ticker_symbol):
     except Exception:
         return None, None
 
-
 def build_scenario_model(hist_df):
-    """分位数回归 + 波动率自适应场景模型"""
-    fit_df = hist_df.dropna().copy()
+    fit_df = hist_df.dropna(subset=['Open', 'High', 'Low', 'Close', '昨收']).copy()
     if len(fit_df) < 15:
         return {'mode': 'insufficient'}
 
@@ -210,7 +194,6 @@ def build_scenario_model(hist_df):
     y_h = (fit_df['High'] / fit_df['昨收'] - 1).values
     y_l = (fit_df['Low'] / fit_df['昨收'] - 1).values
 
-    # 预先计算 OLS 兜底参数
     X_simple = fit_df[['gap']].values
     fallback = {}
     for tag, y in [('h', y_h), ('l', y_l)]:
@@ -232,9 +215,7 @@ def build_scenario_model(hist_df):
 
     return {'mode': 'linear_fallback', 'params': fallback}
 
-
 def predict_scenarios(scenario_model, hist_df):
-    """预测场景参考价 (增加 NaN / Inf 防护)"""
     if not scenario_model or scenario_model.get('mode') == 'insufficient':
         return None, 'insufficient'
 
@@ -243,7 +224,6 @@ def predict_scenarios(scenario_model, hist_df):
     if pd.isna(prev_close) or prev_close <= 0:
         return None, 'insufficient'
 
-    # 安全计算 gap
     open_p = last['Open'] if pd.notnull(last['Open']) else prev_close
     gap = (open_p - prev_close) / prev_close
     if pd.isna(gap) or np.isinf(gap):
@@ -256,7 +236,7 @@ def predict_scenarios(scenario_model, hist_df):
             if pd.isna(recent_vol) or np.isinf(recent_vol):
                 recent_vol = ret.std()
             if pd.isna(recent_vol) or np.isinf(recent_vol):
-                recent_vol = 0.01  # 极限兜底默认值
+                recent_vol = 0.01
 
             X_pred = np.array([[float(gap), float(recent_vol)]])
             models = scenario_model['models']
@@ -269,7 +249,6 @@ def predict_scenarios(scenario_model, hist_df):
             rows = [(scene, h_sorted[i], l_sorted[i]) for i, scene in enumerate(['乐观', '中性', '悲观'])]
             return rows, 'quantile'
         except Exception:
-            # 若分位数预测过程抛错，优雅退回简单线性回归
             pass
 
     if scenario_model.get('params'):
@@ -284,7 +263,6 @@ def predict_scenarios(scenario_model, hist_df):
         return rows, 'linear_fallback'
 
     return None, 'insufficient'
-
 
 def estimate_iv_expected_move(ticker_symbol, current_price):
     try:
@@ -317,7 +295,6 @@ def estimate_iv_expected_move(ticker_symbol, current_price):
     except Exception:
         return None
 
-
 def calculate_turnover_metrics(volume, capital, timestamp_unix):
     if not capital or capital <= 0 or not volume or volume <= 0:
         return 0.0, 0.0, "数据不足"
@@ -346,7 +323,6 @@ def calculate_turnover_metrics(volume, capital, timestamp_unix):
     else:
         return realtime_turnover, realtime_turnover, "已收盘/盘后"
 
-
 def do_fetch_stock_data(ticker_symbol):
     try:
         now_ts = time.time()
@@ -355,13 +331,11 @@ def do_fetch_stock_data(ticker_symbol):
         hist = pd.DataFrame()
         source = "Yahoo Finance"
 
-        # 1. 尝试主源 Yahoo
         try:
             hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"))
         except Exception:
             hist = pd.DataFrame()
 
-        # 2. 备用：网络兜底 Stooq CSV 通道
         if hist.empty or len(hist) < 2:
             try:
                 hist = fetch_chart_stooq_csv(ticker_symbol)
@@ -370,6 +344,11 @@ def do_fetch_stock_data(ticker_symbol):
             except Exception:
                 pass
 
+        if hist.empty or len(hist) < 2:
+            return None
+
+        # 🎯【核心修复 1】：剔除价格为 None / NaN 的未交割脏数据行
+        hist = hist.dropna(subset=['Open', 'High', 'Low', 'Close']).copy()
         if hist.empty or len(hist) < 2:
             return None
 
@@ -383,18 +362,19 @@ def do_fetch_stock_data(ticker_symbol):
         hist['昨收'] = hist['Close'].shift(1)
         hist['MA5'] = hist['Close'].rolling(5).mean()
         hist['MA20'] = hist['Close'].rolling(20).mean()
-        std20 = hist['Close'].rolling(20).std()
+        std20 = hist['Close'].rolling(20).std().fillna(0)
         hist['Upper'], hist['Lower'] = hist['MA20'] + std20 * 2, hist['MA20'] - std20 * 2
         hist['换手率_raw'] = (hist['Volume'] / current_float) if (current_float and current_float > 0) else np.nan
 
         tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
         rmf = tp * hist['Volume']
-        mfr = pd.Series(np.where(tp > tp.shift(1), rmf, 0)).rolling(14).sum() / pd.Series(np.where(tp < tp.shift(1), rmf, 0)).rolling(14).sum()
-        hist['MFI'] = 100 - (100 / (1 + mfr.values))
+        mfr = pd.Series(np.where(tp > tp.shift(1), rmf, 0)).rolling(14).sum() / pd.Series(np.where(tp < tp.shift(1), rmf, 0)).rolling(14).sum().replace(0, 1)
+        hist['MFI'] = (100 - (100 / (1 + mfr))).fillna(50)
 
         avg_vol = hist['Volume'].mean()
         dark = hist[hist['Volume'] > avg_vol * 1.2].tail(8).copy()
-        dark['Signal'] = dark.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
+        if not dark.empty:
+            dark['Signal'] = dark.apply(lambda x: "机构吸筹" if x['Close'] > x['Open'] else "大宗派发", axis=1)
 
         scenario_model = build_scenario_model(hist)
 
@@ -414,15 +394,47 @@ def do_fetch_stock_data(ticker_symbol):
     except Exception:
         return None
 
-
 # ==========================================
-# 🎯 5. 期权链模块
+# 🎯 5. 期权链模块 (使用 cffi 伪造指纹抗 429 限流)
 # ==========================================
 def get_expiration_list(ticker_symbol):
-    tk = yf.Ticker(ticker_symbol)
-    dates = _throttled_yahoo_call(lambda: list(tk.options))
-    return dates
+    """🎯【核心修复 2】：使用 Chrome TLS 指纹抓取期权到期日，免疫云端 429 限流"""
+    try:
+        session = cffi_requests.Session(impersonate="chrome110")
+        session.get("https://fc.yahoo.com", timeout=4)
+        crumb = session.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=4).text.strip()
+        url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker_symbol}?crumb={crumb}"
+        res = session.get(url, timeout=5)
+        if res.status_code == 200:
+            timestamps = res.json()['optionChain']['result'][0].get('expirationDates', [])
+            return [datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d') for ts in timestamps]
+    except Exception:
+        pass
+    
+    # yfinance 备用回退
+    try:
+        tk = yf.Ticker(ticker_symbol)
+        return _throttled_yahoo_call(lambda: list(tk.options))
+    except Exception:
+        return []
 
+def get_raw_options_with_crumb(ticker_symbol, selected_exp):
+    try:
+        session = cffi_requests.Session(impersonate="chrome110")
+        session.get("https://fc.yahoo.com", timeout=4)
+        crumb = session.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=4).text.strip()
+        exp_ts = int(datetime.strptime(selected_exp, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp())
+        url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker_symbol}?date={exp_ts}&crumb={crumb}"
+        res = session.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            options = data['optionChain']['result'][0].get('options', [{}])[0]
+            calls = pd.DataFrame(options.get('calls', []))
+            puts = pd.DataFrame(options.get('puts', []))
+            return calls, puts
+    except Exception:
+        pass
+    return pd.DataFrame(), pd.DataFrame()
 
 def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_price):
     calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
@@ -432,12 +444,19 @@ def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_pri
     status_msg = None
 
     try:
-        tk = yf.Ticker(ticker_symbol)
-        opt = _throttled_yahoo_call(lambda: tk.option_chain(expiration_date), max_retries=1)
-        calls, puts = opt.calls.copy(), opt.puts.copy()
+        calls, puts = get_raw_options_with_crumb(ticker_symbol, expiration_date)
+
+        # 备用源回退
+        if calls.empty and puts.empty:
+            try:
+                tk = yf.Ticker(ticker_symbol)
+                opt = _throttled_yahoo_call(lambda: tk.option_chain(expiration_date), max_retries=1)
+                calls, puts = opt.calls.copy(), opt.puts.copy()
+            except Exception:
+                pass
 
         if calls.empty and puts.empty:
-            status_msg = "该到期日 Yahoo 未返回任何期权报价(可能流动性太低)"
+            status_msg = "该到期日 Yahoo 未返回任何期权报价(可能流动性太低或被限流)"
 
         live_price, _ = get_live_quote(ticker_symbol)
         current_price = live_price if (isinstance(live_price, (int, float)) and live_price and live_price > 0) else fallback_current_price
@@ -547,15 +566,10 @@ def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_pri
                     puts_df = slice_df
 
     except Exception as e:
-        msg = str(e)
-        if "429" in msg or "Too Many Requests" in msg:
-            status_msg = "触发 Yahoo 限流(429),请等几分钟再试,或降低刷新频率(不建议强行重试)"
-        else:
-            status_msg = f"期权数据获取失败: {msg}"
+        status_msg = f"期权数据获取失败: {str(e)}"
         calc_mode = "接口异常"
 
     return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_value, calc_mode, status_msg, atm_iv, move_1d, move_exp
-
 
 # ==========================================
 # 🔄 6. 永不崩溃的后台守护线程
@@ -598,7 +612,6 @@ def background_updater_loop():
         except Exception:
             pass
         time.sleep(180)
-
 
 @st.cache_resource
 def start_background_engine():
@@ -647,7 +660,7 @@ with st.sidebar:
     override_key = f"float_override_{st.session_state.current_ticker}"
     st.session_state[override_key] = manual_float if manual_float > 0 else None
 
-    st.caption(f"📡 期权数据源: Yahoo Finance(经 yfinance) | 全局节流间隔: {GLOBAL_RATE_INTERVAL}s")
+    st.caption(f"📡 期权数据源: Yahoo Finance(经 TLS 穿透) | 节流间隔: {GLOBAL_RATE_INTERVAL}s")
 
 ticker = st.session_state.current_ticker
 st.title(f"🎯 {ticker} 专业量化决策终端")
@@ -755,11 +768,6 @@ else:
             exp_list = get_expiration_list(ticker)
         except Exception as e:
             exp_list = []
-            msg = str(e)
-            if "429" in msg or "Too Many Requests" in msg:
-                st.warning("⚠️ 到期日列表获取被限流(429),请等几分钟再试。")
-            else:
-                st.warning(f"⚠️ 到期日列表获取异常: {e}")
 
         if exp_list:
             today_str = datetime.now().strftime('%Y-%m-%d')
