@@ -140,6 +140,9 @@ def fetch_chart_stooq_csv(symbol):
             df.columns = [c.capitalize() for c in df.columns]
             df['Date'] = pd.to_datetime(df['Date'])
             df = df.set_index('Date').sort_index()
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
             df = df.dropna(subset=['Close', 'Open', 'High', 'Low']).copy()
             if len(df) >= 2:
                 return df
@@ -347,8 +350,14 @@ def do_fetch_stock_data(ticker_symbol):
         if hist.empty or len(hist) < 2:
             return None
 
-        # 🎯【核心修复 1】：剔除价格为 None / NaN 的未交割脏数据行
+        # 🎯 强转数值类型，清洗字符串 'None' 和空数据
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            if col in hist.columns:
+                hist[col] = pd.to_numeric(hist[col], errors='coerce')
+
         hist = hist.dropna(subset=['Open', 'High', 'Low', 'Close']).copy()
+        hist = hist[(hist['Close'] > 0) & (hist['Open'] > 0)].copy()
+
         if hist.empty or len(hist) < 2:
             return None
 
@@ -368,7 +377,12 @@ def do_fetch_stock_data(ticker_symbol):
 
         tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
         rmf = tp * hist['Volume']
-        mfr = pd.Series(np.where(tp > tp.shift(1), rmf, 0)).rolling(14).sum() / pd.Series(np.where(tp < tp.shift(1), rmf, 0)).rolling(14).sum().replace(0, 1)
+        
+        # 🎯 资金 MFI 索引强制对齐修复，防止产生 nan
+        pos_flow = pd.Series(np.where(tp > tp.shift(1), rmf, 0), index=hist.index)
+        neg_flow = pd.Series(np.where(tp < tp.shift(1), rmf, 0), index=hist.index)
+        
+        mfr = pos_flow.rolling(14, min_periods=1).sum() / neg_flow.rolling(14, min_periods=1).sum().replace(0, 1)
         hist['MFI'] = (100 - (100 / (1 + mfr))).fillna(50)
 
         avg_vol = hist['Volume'].mean()
@@ -395,10 +409,9 @@ def do_fetch_stock_data(ticker_symbol):
         return None
 
 # ==========================================
-# 🎯 5. 期权链模块 (使用 cffi 伪造指纹抗 429 限流)
+# 🎯 5. 期权链模块 (伪造 TLS 穿透抗 429)
 # ==========================================
 def get_expiration_list(ticker_symbol):
-    """🎯【核心修复 2】：使用 Chrome TLS 指纹抓取期权到期日，免疫云端 429 限流"""
     try:
         session = cffi_requests.Session(impersonate="chrome110")
         session.get("https://fc.yahoo.com", timeout=4)
@@ -411,7 +424,6 @@ def get_expiration_list(ticker_symbol):
     except Exception:
         pass
     
-    # yfinance 备用回退
     try:
         tk = yf.Ticker(ticker_symbol)
         return _throttled_yahoo_call(lambda: list(tk.options))
@@ -446,7 +458,6 @@ def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_pri
     try:
         calls, puts = get_raw_options_with_crumb(ticker_symbol, expiration_date)
 
-        # 备用源回退
         if calls.empty and puts.empty:
             try:
                 tk = yf.Ticker(ticker_symbol)
