@@ -21,7 +21,6 @@ st.set_page_config(layout="wide", page_title="专业量化决策终端")
 BEIJING_TZ = timezone(timedelta(hours=8))
 GLOBAL_RATE_INTERVAL = 1.0
 
-# 校准股本字典 (符合富途/老虎等主流券商换手率计算口径)
 PRESET_FLOATS = {
     "BTDR": 123715025,
     "AAPL": 15200000000,
@@ -90,11 +89,10 @@ def load_us_stock_library():
 STOCK_LIBRARY = load_us_stock_library()
 
 # ==========================================
-# 📐 3. 股本数据与换手率计算 (精确校准)
+# 📐 3. 股本数据与换手率计算
 # ==========================================
 @st.cache_data(ttl=86400)
 def get_share_stats(ticker_symbol):
-    # 🎯 优先使用已校准的基准股本，确保与券商 App 换手率完全一致
     if ticker_symbol in PRESET_FLOATS:
         return float(PRESET_FLOATS[ticker_symbol]), "基准股本(已校准)"
 
@@ -125,8 +123,57 @@ def get_effective_float(ticker_symbol):
     return get_share_stats(ticker_symbol)
 
 # ==========================================
-# 🚀 4. 抗崩溃行情数据抓取引擎
+# 🚀 4. 抗崩溃行情数据抓取引擎 (带最新日数据缝合)
 # ==========================================
+def fetch_chart_yahoo_direct(symbol):
+    try:
+        session = cffi_requests.Session(impersonate="chrome110")
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range=120d&interval=1d&includePrePost=false"
+        res = session.get(url, timeout=5)
+        if res.status_code == 200:
+            result = res.json()['chart']['result'][0]
+            meta = result.get('meta', {})
+            timestamps = result.get('timestamp', [])
+            quote = result['indicators']['quote'][0]
+            
+            df = pd.DataFrame({
+                'Open': quote.get('open', []),
+                'High': quote.get('high', []),
+                'Low': quote.get('low', []),
+                'Close': quote.get('close', []),
+                'Volume': quote.get('volume', [])
+            }, index=pd.to_datetime(timestamps, unit='s'))
+            
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            df.index = pd.to_datetime(df.index).date
+            
+            # 🎯 盘后元数据补全，防止最新交易日落空
+            if meta and 'regularMarketTime' in meta:
+                meta_dt = datetime.fromtimestamp(meta['regularMarketTime'], tz=timezone.utc).astimezone(timezone(timedelta(hours=-4))).date()
+                p_close = meta.get('regularMarketPrice')
+                if p_close and p_close > 0:
+                    p_open = meta.get('regularMarketOpen', p_close)
+                    p_high = meta.get('regularMarketDayHigh', p_close)
+                    p_low = meta.get('regularMarketDayLow', p_close)
+                    p_vol = meta.get('regularMarketVolume', 0)
+                    
+                    if df.empty or df.index[-1] < meta_dt:
+                        patch_row = pd.DataFrame({
+                            'Open': [p_open], 'High': [p_high], 'Low': [p_low], 'Close': [p_close], 'Volume': [p_vol]
+                        }, index=[meta_dt])
+                        df = pd.concat([df, patch_row])
+                    elif df.index[-1] == meta_dt and pd.isna(df['Close'].iloc[-1]):
+                        df.loc[meta_dt, ['Open', 'High', 'Low', 'Close', 'Volume']] = [p_open, p_high, p_low, p_close, p_vol]
+
+            df = df.dropna(subset=['Close']).copy()
+            if len(df) >= 2:
+                return df, "Yahoo TLS 穿透"
+    except Exception:
+        pass
+    return pd.DataFrame(), ""
+
 def fetch_chart_stooq_csv(symbol):
     try:
         clean_sym = symbol.lower().split('.')[0].replace('^', '')
@@ -142,12 +189,13 @@ def fetch_chart_stooq_csv(symbol):
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
-            df = df.dropna(subset=['Close', 'Open', 'High', 'Low']).copy()
+            df = df.dropna(subset=['Close']).copy()
+            df.index = pd.to_datetime(df.index).date
             if len(df) >= 2:
-                return df
+                return df, "Stooq CSV 通道"
     except Exception:
         pass
-    return pd.DataFrame()
+    return pd.DataFrame(), ""
 
 def fetch_macro_api(symbol, stooq_symbol):
     try:
@@ -162,7 +210,7 @@ def fetch_macro_api(symbol, stooq_symbol):
     except Exception:
         pass
     try:
-        s_df = fetch_chart_stooq_csv(stooq_symbol)
+        s_df, _ = fetch_chart_stooq_csv(stooq_symbol)
         if not s_df.empty and len(s_df) >= 2:
             p1, p2 = s_df['Close'].iloc[-1], s_df['Close'].iloc[-2]
             return p1, (p1 / p2 - 1)
@@ -331,28 +379,45 @@ def do_fetch_stock_data(ticker_symbol):
         fetch_time_bj = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
         hist = pd.DataFrame()
-        source = "Yahoo Finance"
+        source = ""
 
-        try:
-            hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"))
-        except Exception:
-            hist = pd.DataFrame()
+        # 1. TLS 伪装穿透抓取 + 自动补全缝合最新交易日
+        hist, source = fetch_chart_yahoo_direct(ticker_symbol)
+
+        # 2. 备用源处理
+        if hist.empty or len(hist) < 2:
+            try:
+                hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"))
+                if not hist.empty:
+                    source = "yfinance 官方库"
+            except Exception:
+                hist = pd.DataFrame()
 
         if hist.empty or len(hist) < 2:
             try:
-                hist = fetch_chart_stooq_csv(ticker_symbol)
-                if not hist.empty:
-                    source = "Stooq (网络兜底)"
+                hist, source = fetch_chart_stooq_csv(ticker_symbol)
             except Exception:
                 pass
 
         if hist.empty or len(hist) < 2:
             return None
 
-        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-            if col in hist.columns:
-                hist[col] = pd.to_numeric(hist[col], errors='coerce')
+        # 🎯【核心修复】：若最新交易日开/高/低有缺漏，自动用收盘价或 live_quote 填补
+        last_idx = hist.index[-1]
+        live_p, live_v = get_live_quote(ticker_symbol)
+        
+        if pd.isna(hist.loc[last_idx, 'Close']) and live_p and live_p > 0:
+            hist.loc[last_idx, 'Close'] = live_p
+            
+        if pd.notnull(hist.loc[last_idx, 'Close']):
+            p_c = hist.loc[last_idx, 'Close']
+            if pd.isna(hist.loc[last_idx, 'Open']): hist.loc[last_idx, 'Open'] = p_c
+            if pd.isna(hist.loc[last_idx, 'High']): hist.loc[last_idx, 'High'] = p_c
+            if pd.isna(hist.loc[last_idx, 'Low']): hist.loc[last_idx, 'Low'] = p_c
+            if pd.isna(hist.loc[last_idx, 'Volume']) or hist.loc[last_idx, 'Volume'] == 0:
+                hist.loc[last_idx, 'Volume'] = live_v if (live_v and live_v > 0) else 0
 
+        # 清洗掉中间历史脏行
         hist = hist.dropna(subset=['Open', 'High', 'Low', 'Close']).copy()
         hist = hist[(hist['Close'] > 0) & (hist['Open'] > 0)].copy()
 
@@ -389,7 +454,6 @@ def do_fetch_stock_data(ticker_symbol):
 
         scenario_model = build_scenario_model(hist)
 
-        live_price, live_volume = get_live_quote(ticker_symbol)
         volume_for_turnover = live_volume if (live_volume and live_volume > 0) else hist['Volume'].iloc[-1]
         rt_turnover, proj_turnover, trade_status = calculate_turnover_metrics(volume_for_turnover, current_float, now_ts)
 
@@ -406,7 +470,7 @@ def do_fetch_stock_data(ticker_symbol):
         return None
 
 # ==========================================
-# 🎯 5. 期权链模块 (伪造 TLS 穿透抗 429)
+# 🎯 5. 期权链模块
 # ==========================================
 def get_expiration_list(ticker_symbol):
     try:
