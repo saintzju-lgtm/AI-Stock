@@ -21,7 +21,7 @@ st.set_page_config(layout="wide", page_title="专业量化决策终端")
 BEIJING_TZ = timezone(timedelta(hours=8))
 GLOBAL_RATE_INTERVAL = 1.0
 
-# 🎯 最新增发稀释后股本字典 (BTDR 校准为 1.5628 亿股，换手率精准对齐 9.52%)
+# 🎯 校准股本字典 (BTDR 校准为 1.5628 亿股)
 PRESET_FLOATS = {
     "BTDR": 156280000,
     "AAPL": 15200000000,
@@ -33,7 +33,7 @@ PRESET_FLOATS = {
 }
 
 # ==========================================
-# 🧠 1. 全局解耦内存存储中心
+# 🧠 1. 全局解耦内存存储中心与网络引擎
 # ==========================================
 @st.cache_resource
 def get_global_data_store():
@@ -41,12 +41,41 @@ def get_global_data_store():
         "stock_cache": {},
         "options_cache": {},
         "fetch_timestamps": {},
+        "crumb_cache": None,      # 🎯 长期缓存 Crumb 与 Session
         "active_queue": set(["BTDR", "AAPL", "TSLA", "NVDA"]),
         "lock": threading.Lock(),
         "last_yahoo_call_ts": 0.0,
     }
 
 GLOBAL_STORE = get_global_data_store()
+
+def get_dynamic_ttl():
+    """🎯 盘后/周末 TTL 自动延长至 30 分钟，交易时段保持 3 分钟"""
+    now_est = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=-4)))
+    # 周末 或 盘外时间 (09:30 前 / 16:00 后)
+    if now_est.weekday() >= 5 or now_est.hour < 9 or (now_est.hour == 9 and now_est.minute < 30) or now_est.hour >= 16:
+        return 1800  # 盘后 30 分钟缓存
+    return 180       # 盘中 3 分钟缓存
+
+def get_persistent_yahoo_session():
+    """🎯 防封核心 1：Crumb 与 Session 缓存 6 小时，拒绝频繁重新握手"""
+    with GLOBAL_STORE["lock"]:
+        cached = GLOBAL_STORE.get("crumb_cache")
+        now = time.time()
+        if cached and (now - cached["time"] < 21600):  # 6 小时内复用
+            return cached["session"], cached["crumb"]
+
+        try:
+            session = cffi_requests.Session(impersonate="chrome110")
+            session.get("https://fc.yahoo.com", timeout=4)
+            crumb_res = session.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=4)
+            crumb = crumb_res.text.strip()
+            if crumb and len(crumb) < 30 and "{" not in crumb:
+                GLOBAL_STORE["crumb_cache"] = {"session": session, "crumb": crumb, "time": now}
+                return session, crumb
+        except Exception:
+            pass
+        return cffi_requests.Session(impersonate="chrome110"), ""
 
 def _throttled_yahoo_call(func, max_retries=1):
     last_err = None
@@ -68,7 +97,7 @@ def _throttled_yahoo_call(func, max_retries=1):
     raise last_err
 
 # ==========================================
-# 🔍 2. 动态加载全量美股库
+# 🔍 2. 动态加载美股库
 # ==========================================
 @st.cache_data(ttl=86400)
 def load_us_stock_library():
@@ -90,7 +119,7 @@ def load_us_stock_library():
 STOCK_LIBRARY = load_us_stock_library()
 
 # ==========================================
-# 📐 3. 股本数据与换手率计算
+# 📐 3. 股本与换手率计算
 # ==========================================
 def get_share_stats(ticker_symbol):
     if ticker_symbol in PRESET_FLOATS:
@@ -123,11 +152,11 @@ def get_effective_float(ticker_symbol):
     return get_share_stats(ticker_symbol)
 
 # ==========================================
-# 🚀 4. 8/17 最新交易日元数据强缝合抓取引擎
+# 🚀 4. K 线数据抓取引擎
 # ==========================================
 def fetch_chart_yahoo_direct(symbol):
     try:
-        session = cffi_requests.Session(impersonate="chrome110")
+        session, _ = get_persistent_yahoo_session()
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range=120d&interval=1d&includePrePost=false"
         res = session.get(url, timeout=5)
         if res.status_code == 200:
@@ -176,7 +205,7 @@ def fetch_chart_yahoo_direct(symbol):
             df = df[~df.index.duplicated(keep='last')].sort_index()
             df = df.ffill().bfill()
             if len(df) >= 2:
-                return df, "Yahoo TLS 缝合引擎"
+                return df, "Yahoo TLS 穿透引擎"
     except Exception:
         pass
     return pd.DataFrame(), ""
@@ -206,8 +235,9 @@ def fetch_chart_stooq_csv(symbol):
 
 def fetch_macro_api(symbol, stooq_symbol):
     try:
+        session, _ = get_persistent_yahoo_session()
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
-        res = _throttled_yahoo_call(lambda: requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3))
+        res = session.get(url, timeout=3)
         if res.status_code == 200:
             meta = res.json()['chart']['result'][0]['meta']
             price = meta.get('regularMarketPrice', 0.0)
@@ -328,7 +358,7 @@ def estimate_iv_expected_move(ticker_symbol, current_price):
             return None
         nearest_exp = exp_list[0]
 
-        opt_key = f"v6_{ticker_symbol}_{nearest_exp}"
+        opt_key = f"v7_{ticker_symbol}_{nearest_exp}"
         opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
         if not opt_data:
             opt_data = do_fetch_option_details(ticker_symbol, nearest_exp, current_price)
@@ -388,9 +418,10 @@ def do_fetch_stock_data(ticker_symbol):
         hist = pd.DataFrame()
         source = ""
 
-        # 1. TLS 伪装抓取 + 8/17 元数据强缝合
+        # 1. 优先：TLS 伪装抓取 + 元数据缝合
         hist, source = fetch_chart_yahoo_direct(ticker_symbol)
 
+        # 2. 备用源
         if hist.empty or len(hist) < 2:
             try:
                 hist = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).history(period="100d", interval="1d"))
@@ -421,7 +452,7 @@ def do_fetch_stock_data(ticker_symbol):
         std20 = hist['Close'].rolling(20).std().fillna(0)
         hist['Upper'], hist['Lower'] = hist['MA20'] + std20 * 2, hist['MA20'] - std20 * 2
         
-        # 🎯 准确计算 8/17 换手率：14,882,917 / 156,280,000 = 9.52%
+        # 换手率精计算
         hist['换手率_raw'] = (hist['Volume'] / current_float) if (current_float and current_float > 0) else np.nan
 
         tp = (hist['High'] + hist['Low'] + hist['Close']) / 3
@@ -457,13 +488,11 @@ def do_fetch_stock_data(ticker_symbol):
         return None
 
 # ==========================================
-# 🎯 5. 期权链模块
+# 🎯 5. 期权链模块 (复用持久化 Session)
 # ==========================================
 def get_expiration_list(ticker_symbol):
     try:
-        session = cffi_requests.Session(impersonate="chrome110")
-        session.get("https://fc.yahoo.com", timeout=4)
-        crumb = session.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=4).text.strip()
+        session, crumb = get_persistent_yahoo_session()
         url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker_symbol}?crumb={crumb}"
         res = session.get(url, timeout=5)
         if res.status_code == 200:
@@ -480,9 +509,7 @@ def get_expiration_list(ticker_symbol):
 
 def get_raw_options_with_crumb(ticker_symbol, selected_exp):
     try:
-        session = cffi_requests.Session(impersonate="chrome110")
-        session.get("https://fc.yahoo.com", timeout=4)
-        crumb = session.get("https://query2.finance.yahoo.com/v1/test/getcrumb", timeout=4).text.strip()
+        session, crumb = get_persistent_yahoo_session()
         exp_ts = int(datetime.strptime(selected_exp, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp())
         url = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker_symbol}?date={exp_ts}&crumb={crumb}"
         res = session.get(url, timeout=5)
@@ -631,7 +658,7 @@ def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_pri
     return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_value, calc_mode, status_msg, atm_iv, move_1d, move_exp
 
 # ==========================================
-# 🔄 6. 永不崩溃的后台守护线程
+# 🔄 6. 永不崩溃的后台守护线程 (仅更新 K 线)
 # ==========================================
 def background_updater_loop():
     while True:
@@ -644,33 +671,15 @@ def background_updater_loop():
                     data = do_fetch_stock_data(ticker)
                     if data:
                         with GLOBAL_STORE["lock"]:
-                            GLOBAL_STORE["stock_cache"][f"v6_{ticker}"] = data
-                            GLOBAL_STORE["fetch_timestamps"][f"v6_{ticker}"] = data[3]['timestamp']
-
-                        hist_df, _, _, _ = data
-                        last_price = hist_df['Close'].iloc[-1]
-
-                        try:
-                            exp_list = get_expiration_list(ticker)
-                        except Exception:
-                            exp_list = []
-
-                        for exp_date in exp_list[:2]:
-                            try:
-                                opt_key = f"v6_{ticker}_{exp_date}"
-                                opt_data = do_fetch_option_details(ticker, exp_date, last_price)
-                                with GLOBAL_STORE["lock"]:
-                                    GLOBAL_STORE["options_cache"][opt_key] = opt_data
-                            except Exception:
-                                pass
-
+                            GLOBAL_STORE["stock_cache"][f"v7_{ticker}"] = data
+                            GLOBAL_STORE["fetch_timestamps"][f"v7_{ticker}"] = data[3]['timestamp']
                 except Exception:
                     pass
                 time.sleep(2.0)
 
         except Exception:
             pass
-        time.sleep(180)
+        time.sleep(get_dynamic_ttl()) # 🎯 盘后自动降频轮询
 
 @st.cache_resource
 def start_background_engine():
@@ -681,7 +690,7 @@ def start_background_engine():
 start_background_engine()
 
 # ==========================================
-# 🖥️ 7. 纯前端 UI 渲染层 (切换 v6_ 前缀)
+# 🖥️ 7. 纯前端 UI 渲染层 (缓存强切 v7_)
 # ==========================================
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; } </style>""", unsafe_allow_html=True)
 
@@ -719,16 +728,16 @@ with st.sidebar:
     override_key = f"float_override_{st.session_state.current_ticker}"
     st.session_state[override_key] = manual_float if manual_float > 0 else None
 
-    st.caption(f"📡 期权数据源: Yahoo Finance(经 TLS 穿透) | 节流间隔: {GLOBAL_RATE_INTERVAL}s")
+    st.caption(f"📡 期权数据源: Yahoo Finance(持久 Session) | 节流间隔: {GLOBAL_RATE_INTERVAL}s")
 
 ticker = st.session_state.current_ticker
 st.title(f"🎯 {ticker} 专业量化决策终端")
 
-# 🎯 强制切换至 v6_ 缓存前缀，彻底抹去所有包含 12.03% 换手率的旧数据
-stock_data = GLOBAL_STORE["stock_cache"].get(f"v6_{ticker}")
-last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v6_{ticker}", 0)
+# 🎯 切换至 v7_ 内存缓存前缀，彻底清空所有旧版本死锁数据
+stock_data = GLOBAL_STORE["stock_cache"].get(f"v7_{ticker}")
+last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v7_{ticker}", 0)
 now_ts = time.time()
-is_expired = (now_ts - last_ts) > 180
+is_expired = (now_ts - last_ts) > get_dynamic_ttl()
 
 if not stock_data or is_expired:
     with st.spinner(f"🔄 正在同步 **{ticker}** 最新市场数据..."):
@@ -736,8 +745,8 @@ if not stock_data or is_expired:
         if fresh_data:
             stock_data = fresh_data
             with GLOBAL_STORE["lock"]:
-                GLOBAL_STORE["stock_cache"][f"v6_{ticker}"] = fresh_data
-                GLOBAL_STORE["fetch_timestamps"][f"v6_{ticker}"] = fresh_data[3]['timestamp']
+                GLOBAL_STORE["stock_cache"][f"v7_{ticker}"] = fresh_data
+                GLOBAL_STORE["fetch_timestamps"][f"v7_{ticker}"] = fresh_data[3]['timestamp']
                 GLOBAL_STORE["active_queue"].add(ticker)
 
 if not stock_data:
@@ -839,7 +848,7 @@ else:
 
             selected_exp = st.selectbox("📅 选择期权到期日", options=exp_list, index=default_exp_idx)
 
-            opt_key = f"v6_{ticker}_{selected_exp}"
+            opt_key = f"v7_{ticker}_{selected_exp}"
             opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
             if not opt_data or is_expired:
                 opt_data = do_fetch_option_details(ticker, selected_exp, last['Close'])
