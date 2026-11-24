@@ -70,7 +70,6 @@ def get_global_data_store():
         "darkpool_cache": {},
         "macro_cache": {"data": None, "ts": 0.0},
         "fetch_timestamps": {},
-        # 锁定后台核心刷新队列，不再接收外部任意输入，防止被脚本撑爆
         "core_queue": ["NVDA", "AAPL", "TSLA", "BTDR"],
         "call_history": [],
         "lock": threading.Lock(),
@@ -303,12 +302,13 @@ def fetch_finra_darkpool_data(ticker_symbol, lookback_days=7):
 # ==========================================
 # 🚀 5. K 线、盘前/盘中实时快照与宏观引擎
 # ==========================================
-def fetch_realtime_signal_snapshot(ticker_symbol):
+def fetch_realtime_signal_snapshot(ticker_symbol, fallback_prev_close=None):
+    """精准锁定上一交易日常规盘收盘价作为基准，避免 Yahoo chartPreviousClose 错取前天价格"""
     if not check_global_rate_limit():
         return None
     try:
         session = cffi_requests.Session(impersonate="chrome110")
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=2d&interval=5m&includePrePost=true"
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=5d&interval=5m&includePrePost=true"
         res = session.get(url, timeout=4)
         if res.status_code != 200:
             return None
@@ -332,12 +332,22 @@ def fetch_realtime_signal_snapshot(ticker_symbol):
         today_et = datetime.now(US_EASTERN_TZ).date()
         today_df = df[df.index.map(lambda x: x.date() == today_et)].copy()
 
+        # 精确提取“上一个交易日”的常规盘收盘价 (09:30 - 16:00 ET)
+        prev_days_reg = df[
+            df.index.map(lambda x: x.date() < today_et and 570 <= (x.hour * 60 + x.minute) < 960)
+        ]
+        if not prev_days_reg.empty:
+            prev_close = float(prev_days_reg["Close"].iloc[-1])
+        elif fallback_prev_close and fallback_prev_close > 0:
+            prev_close = float(fallback_prev_close)
+        else:
+            prev_close = float(meta.get("regularMarketPrice") or df["Close"].iloc[0])
+
         pre_df = today_df[today_df.index.map(lambda x: (x.hour * 60 + x.minute) < 570)]
         reg_df = today_df[today_df.index.map(lambda x: 570 <= (x.hour * 60 + x.minute) < 960)]
 
-        prev_close = float(meta.get("chartPreviousClose") or meta.get("previousClose") or df["Close"].iloc[0])
         live_price = float(today_df["Close"].iloc[-1]) if not today_df.empty else float(meta.get("regularMarketPrice", prev_close))
-        gap_pct = (live_price / prev_close - 1.0) * 100.0
+        gap_pct = (live_price / prev_close - 1.0) * 100.0 if prev_close > 0 else 0.0
 
         vwap, orb_high, orb_low = np.nan, np.nan, np.nan
         if not reg_df.empty:
@@ -932,17 +942,27 @@ def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
     action_tip = "观望为主，等待价格靠近关键支撑/阻力或 VWAP 再行动。"
     price = snap["live_price"]
     gap = snap["gap_pct"]
+    pre_vol = snap["pre_vol"]
     now_et = datetime.now(US_EASTERN_TZ)
     t_min = now_et.hour * 60 + now_et.minute
     is_premarket = t_min < 570
 
+    # 1. 盘前预判 (区分高开/低开，并结合盘前量能过滤假异动)
     if is_premarket:
-        if abs(gap) >= 2.0:
-            direction = "大幅高开" if gap > 0 else "大幅低开"
-            signals.append(f"🌅 **盘前异动 ({direction} {gap:+.2f}%)**：开盘前 15 分钟波动剧烈，避免市价追单。")
-        if avg_daily_vol > 0 and snap["pre_vol"] > avg_daily_vol * 0.08:
-            signals.append(f"🔥 **盘前显著放量**：已成交 {snap['pre_vol']:,} 股（超日均量 8%），今日大概率走单边趋势。")
+        vol_note = "（盘前成交极少，流动性不足，谨防假突破/假跌破）" if pre_vol < 1000 else ""
+        if gap >= 2.0:
+            signals.append(f"🌅 **盘前大幅高开 ({gap:+.2f}%)**：开盘易有获利回吐，避免开盘直接市价追高。{vol_note}")
+            action_tip = "盘前偏强：等待开盘后回踩 VWAP 或守住开盘价再考虑顺势介入。"
+        elif gap <= -2.0:
+            signals.append(f"🌧️ **盘前大幅低开 ({gap:+.2f}%)**：开盘抛压较重，切忌前 15 分钟盲目左侧抄底。{vol_note}")
+            action_tip = "盘前偏弱：防守为主，观察开盘后能否快速收回跌幅或在下沿支撑企稳。"
+        else:
+            action_tip = f"盘前平开震荡 ({gap:+.2f}%)：等待 09:30 开盘后的量能方向选择。"
 
+        if avg_daily_vol > 0 and pre_vol > avg_daily_vol * 0.08:
+            signals.append(f"🔥 **盘前显著放量**：已成交 {pre_vol:,} 股（超日均量 8%），今日大概率走单边趋势。")
+
+    # 2. 盘中 VWAP & ORB 突破
     if not is_premarket:
         if pd.notnull(snap["vwap"]):
             if price > snap["vwap"] * 1.002:
@@ -958,6 +978,7 @@ def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
             elif price < snap["orb_low"]:
                 signals.append(f"📉 **跌破开盘 15 分钟低点 (ORB ${snap['orb_low']:.2f})**：日内弱势破位。")
 
+    # 3. 现价与期权墙位联动
     if opt_data:
         _, _, cw, pw, gf, _, _, _, _, _, _, _, _, _ = opt_data
         if pd.notnull(cw) and price >= cw * 0.992:
@@ -969,7 +990,7 @@ def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
             signals.append(f"🛡️ **回踩 Put Wall (${pw:.2f})**：机构强支撑区，留意放量止跌的买点。")
         if pd.notnull(gf):
             if is_premarket and price < gf:
-                signals.append(f"⚠️ **盘前位于 Gamma Flip (${gf:.2f}) 下方**：今日将处于负伽马高波动环境，谨防急跌。")
+                signals.append(f"⚠️ **盘前位于 Gamma Flip (${gf:.2f}) 下方**：若开盘后无法收复该点位，今日将处于负伽马高波动环境。")
             elif abs(price - gf) / price <= 0.006:
                 signals.append(f"🌀 **正处 Gamma Flip (${gf:.2f}) 变盘临界点**：即将决定今日是稳步震荡还是加速波动。")
 
@@ -1062,8 +1083,8 @@ def background_updater_loop():
                 try:
                     data = do_fetch_stock_data(tk)
                     if data:
-                        safe_cache_set(GLOBAL_STORE["stock_cache"], f"v14_{tk}", data)
-                        safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v14_{tk}", data[3]["timestamp"])
+                        safe_cache_set(GLOBAL_STORE["stock_cache"], f"v15_{tk}", data)
+                        safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v15_{tk}", data[3]["timestamp"])
                 except Exception:
                     pass
                 time.sleep(3.0)
@@ -1115,7 +1136,7 @@ with st.sidebar:
         else:
             st.session_state["last_manual_refresh"] = now
             with GLOBAL_STORE["lock"]:
-                GLOBAL_STORE["stock_cache"].pop(f"v14_{st.session_state.current_ticker}", None)
+                GLOBAL_STORE["stock_cache"].pop(f"v15_{st.session_state.current_ticker}", None)
                 GLOBAL_STORE["darkpool_cache"].pop(f"dp_{st.session_state.current_ticker}", None)
                 GLOBAL_STORE["intraday_cache"].pop(f"{st.session_state.current_ticker}_15m", None)
                 GLOBAL_STORE["intraday_cache"].pop(f"{st.session_state.current_ticker}_60m", None)
@@ -1126,7 +1147,6 @@ with st.sidebar:
     float_mode = st.radio("默认分母口径", ["流通股本 (Float)", "总股本 (Outstanding)"], index=0)
     manual_float = st.number_input(f"{st.session_state.current_ticker} 手动修正股本 (留0自动)", min_value=0, value=0, step=1000000)
 
-    # 实时展示系统安全状态
     with GLOBAL_STORE["lock"]:
         cur_calls = len([t for t in GLOBAL_STORE["call_history"] if time.time() - t < 60])
         cur_cached = len(GLOBAL_STORE["stock_cache"])
@@ -1141,8 +1161,8 @@ with tab_main:
     ticker = st.session_state.current_ticker
     st.title(f"🎯 {ticker} 专业量化决策终端 Pro")
 
-    stock_data = GLOBAL_STORE["stock_cache"].get(f"v14_{ticker}")
-    last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v14_{ticker}", 0)
+    stock_data = GLOBAL_STORE["stock_cache"].get(f"v15_{ticker}")
+    last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v15_{ticker}", 0)
     is_expired = (time.time() - last_ts) > get_dynamic_ttl()
 
     if not stock_data or is_expired:
@@ -1150,8 +1170,8 @@ with tab_main:
             fresh_data = do_fetch_stock_data(ticker)
             if fresh_data:
                 stock_data = fresh_data
-                safe_cache_set(GLOBAL_STORE["stock_cache"], f"v14_{ticker}", fresh_data)
-                safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v14_{ticker}", fresh_data[3]["timestamp"])
+                safe_cache_set(GLOBAL_STORE["stock_cache"], f"v15_{ticker}", fresh_data)
+                safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v15_{ticker}", fresh_data[3]["timestamp"])
 
     if not stock_data:
         st.error(f"⚠️ 无法拉取 **{ticker}** 的数据（可能代码有误、数据源波动，或触发了全站频率熔断保护，请稍后再试）。")
@@ -1201,7 +1221,7 @@ with tab_main:
                     target_exps = [selected_exp]
                     selected_exp_label = selected_exp
 
-                opt_key = f"v14_{ticker}_{'_'.join(target_exps)}"
+                opt_key = f"v15_{ticker}_{'_'.join(target_exps)}"
                 opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
                 if not opt_data or is_expired:
                     with st.spinner("🕯️ 正在计算期权链与 GEX..."):
@@ -1210,17 +1230,24 @@ with tab_main:
             else:
                 st.caption("该标的暂无期权链")
 
+        # 计算日线上的昨日收盘价作为兜底
+        today_et_date = datetime.now(US_EASTERN_TZ).date()
+        if hist_df.index[-1] < today_et_date:
+            daily_prev_close = float(hist_df["Close"].iloc[-1])
+        else:
+            daily_prev_close = float(hist_df["Close"].iloc[-2]) if len(hist_df) >= 2 else float(hist_df["Close"].iloc[-1])
+
         # 📡 盘前/盘中局部自动刷新信号雷达
         refresh_sec = get_live_refresh_interval() if auto_refresh_on else None
 
         @st.fragment(run_every=refresh_sec)
-        def render_live_radar(ticker_sym, avg_vol, opt_snapshot):
-            snap = fetch_realtime_signal_snapshot(ticker_sym)
+        def render_live_radar(ticker_sym, avg_vol, opt_snapshot, fb_prev_close):
+            snap = fetch_realtime_signal_snapshot(ticker_sym, fb_prev_close)
             if not snap:
                 return
             status_txt = f"自动刷新中 (每 {refresh_sec}s)" if refresh_sec else "手动模式 (可在左侧开启盘中自动刷新)"
             with st.container(border=True):
-                st.caption(f"📡 **盘前/盘中实时信号雷达** | 更新于 {snap['update_time']} (北京时间) | {status_txt}")
+                st.caption(f"📡 **盘前/盘中实时信号雷达** | 昨收基准: **${snap['prev_close']:.2f}** | 更新于 {snap['update_time']} (北京时间) | {status_txt}")
                 r1, r2, r3, r4 = st.columns(4)
                 r1.metric("最新价 (含盘前/盘后)", f"${snap['live_price']:.2f}", f"{snap['gap_pct']:+.2f}%")
                 r2.metric("日内机构 VWAP", f"${snap['vwap']:.2f}" if pd.notnull(snap["vwap"]) else "未开盘")
@@ -1236,7 +1263,7 @@ with tab_main:
                     st.caption("当前暂无显著盘中异动信号，行情处于常规波动区间。")
 
         avg_20d_vol = float(hist_df["Volume"].tail(20).mean())
-        render_live_radar(ticker, avg_20d_vol, opt_data)
+        render_live_radar(ticker, avg_20d_vol, opt_data, daily_prev_close)
 
         # 🧠 综合量化诊断与可执行交易建议
         verdict, v_color, bullets, warnings, stock_plan, opt_strategy = generate_quant_diagnosis(ticker, hist_df, dp_df, mkt, opt_data)
@@ -1410,12 +1437,12 @@ with tab_watch:
             rows_wl = []
             progress = st.progress(0)
             for idx, tk in enumerate(wl_tickers):
-                data = GLOBAL_STORE["stock_cache"].get(f"v14_{tk}")
+                data = GLOBAL_STORE["stock_cache"].get(f"v15_{tk}")
                 if not data:
                     data = do_fetch_stock_data(tk)
                     if data:
-                        safe_cache_set(GLOBAL_STORE["stock_cache"], f"v14_{tk}", data)
-                        safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v14_{tk}", data[3]["timestamp"])
+                        safe_cache_set(GLOBAL_STORE["stock_cache"], f"v15_{tk}", data)
+                        safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v15_{tk}", data[3]["timestamp"])
                 if data:
                     h_df, _, d_df, m = data
                     l_row = h_df.iloc[-1]
@@ -1447,7 +1474,7 @@ with tab_watch:
                 "涨跌幅%": "{:+.2f}%",
                 "预估换手%": "{:.2f}%",
                 "MFI(14)": "{:.1f}",
-                "HV20%": "{:.1f}%",
+                "HV20%": "{:.1f}",
                 "暗池做空%": "{:.1f}%",
             }, na_rep="N/A"),
             use_container_width=True,
