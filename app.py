@@ -45,6 +45,7 @@ def get_global_data_store():
 GLOBAL_STORE = get_global_data_store()
 
 def get_dynamic_ttl():
+    """主数据缓存 TTL：交易时段 3 分钟，非交易时段 30 分钟"""
     now_et = datetime.now(US_EASTERN_TZ)
     if now_et.weekday() >= 5:
         return 1800
@@ -52,6 +53,22 @@ def get_dynamic_ttl():
     if t_min < 9 * 60 + 30 or t_min >= 16 * 60:
         return 1800
     return 180
+
+def get_live_refresh_interval():
+    """盘前/盘中实时雷达局部刷新秒数，非交易时段返回 None"""
+    now_et = datetime.now(US_EASTERN_TZ)
+    if now_et.weekday() >= 5:
+        return None
+    t_min = now_et.hour * 60 + now_et.minute
+    if 480 <= t_min < 570:      # 盘前 08:00 - 09:30
+        return 60
+    elif 570 <= t_min < 600:    # 开盘黄金30分 09:30 - 10:00
+        return 20
+    elif 600 <= t_min < 900:    # 盘中常规 10:00 - 15:00
+        return 60
+    elif 900 <= t_min < 960:    # 尾盘 15:00 - 16:00
+        return 30
+    return None
 
 def _throttled_yahoo_call(func, max_retries=1):
     last_err = None
@@ -129,7 +146,6 @@ STOCK_LIBRARY = load_us_stock_library()
 # 📐 3. 基础信息 (股本 + 财报日) 与换手率
 # ==========================================
 def fetch_fundamental_stats(ticker_symbol):
-    """一次请求同时获取流通股、总股本与下次财报日期"""
     info = {}
     try:
         info = _throttled_yahoo_call(lambda: yf.Ticker(ticker_symbol).info)
@@ -232,8 +248,68 @@ def fetch_finra_darkpool_data(ticker_symbol, lookback_days=7):
     return df
 
 # ==========================================
-# 🚀 5. K 线 (日线 + 分时 VWAP) 与宏观引擎
+# 🚀 5. K 线、盘前/盘中实时快照与宏观引擎
 # ==========================================
+def fetch_realtime_signal_snapshot(ticker_symbol):
+    """轻量级抓取：含盘前/盘中最新价、5分钟K线(算VWAP与ORB)、盘前成交量"""
+    try:
+        session = cffi_requests.Session(impersonate="chrome110")
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=2d&interval=5m&includePrePost=true"
+        res = session.get(url, timeout=4)
+        if res.status_code != 200:
+            return None
+
+        result = res.json()["chart"]["result"][0]
+        meta = result.get("meta", {})
+        timestamps = result.get("timestamp", [])
+        quote = result["indicators"]["quote"][0]
+
+        df = pd.DataFrame({
+            "Open": quote.get("open", []),
+            "High": quote.get("high", []),
+            "Low": quote.get("low", []),
+            "Close": quote.get("close", []),
+            "Volume": quote.get("volume", []),
+        }, index=[datetime.fromtimestamp(ts, tz=US_EASTERN_TZ) for ts in timestamps])
+
+        df = df.dropna(subset=["Close"]).copy()
+        df["Volume"] = df["Volume"].fillna(0.0)
+
+        today_et = datetime.now(US_EASTERN_TZ).date()
+        today_df = df[df.index.map(lambda x: x.date() == today_et)].copy()
+
+        pre_df = today_df[today_df.index.map(lambda x: (x.hour * 60 + x.minute) < 570)]
+        reg_df = today_df[today_df.index.map(lambda x: 570 <= (x.hour * 60 + x.minute) < 960)]
+
+        prev_close = float(meta.get("chartPreviousClose") or meta.get("previousClose") or df["Close"].iloc[0])
+        live_price = float(today_df["Close"].iloc[-1]) if not today_df.empty else float(meta.get("regularMarketPrice", prev_close))
+        gap_pct = (live_price / prev_close - 1.0) * 100.0
+
+        vwap, orb_high, orb_low = np.nan, np.nan, np.nan
+        if not reg_df.empty:
+            tp = (reg_df["High"] + reg_df["Low"] + reg_df["Close"]) / 3.0
+            vol_sum = reg_df["Volume"].sum()
+            if vol_sum > 0:
+                vwap = float((tp * reg_df["Volume"]).sum() / vol_sum)
+            orb_df = reg_df.iloc[:3]  # 开盘前15分钟
+            if len(orb_df) >= 1:
+                orb_high = float(orb_df["High"].max())
+                orb_low = float(orb_df["Low"].min())
+
+        return {
+            "live_price": live_price,
+            "prev_close": prev_close,
+            "gap_pct": gap_pct,
+            "pre_vol": int(pre_df["Volume"].sum()) if not pre_df.empty else 0,
+            "reg_vol": int(reg_df["Volume"].sum()) if not reg_df.empty else 0,
+            "vwap": vwap,
+            "orb_high": orb_high,
+            "orb_low": orb_low,
+            "update_time": datetime.now(BEIJING_TZ).strftime("%H:%M:%S"),
+        }
+    except Exception:
+        return None
+
 def fetch_chart_yahoo_direct(symbol):
     try:
         session = cffi_requests.Session(impersonate="chrome110")
@@ -291,7 +367,6 @@ def fetch_chart_yahoo_direct(symbol):
     return pd.DataFrame(), ""
 
 def fetch_intraday_chart(symbol, interval="15m"):
-    """抓取 15m 或 60m 分时 K 线并计算按日重置的 VWAP"""
     cache_key = f"{symbol}_{interval}"
     cached = GLOBAL_STORE["intraday_cache"].get(cache_key)
     if cached and (time.time() - cached["ts"] < 180):
@@ -319,7 +394,6 @@ def fetch_intraday_chart(symbol, interval="15m"):
             df = df.dropna(subset=["Close"]).copy()
             df["Volume"] = df["Volume"].fillna(0.0)
 
-            # 按美东交易日重置计算 VWAP
             df["trade_date"] = [ts.date() for ts in df.index]
             tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
             df["tp_vol"] = tp * df["Volume"]
@@ -497,7 +571,6 @@ def do_fetch_stock_data(ticker_symbol):
         std20 = hist["Close"].rolling(20).std().fillna(0)
         hist["Upper"], hist["Lower"] = hist["MA20"] + std20 * 2, hist["MA20"] - std20 * 2
 
-        # 20日年化历史波动率 (HV20)
         log_ret = np.log(hist["Close"] / hist["Close"].shift(1))
         hv20 = float(log_ret.tail(20).std() * np.sqrt(252)) if len(log_ret.dropna()) >= 10 else np.nan
 
@@ -608,7 +681,6 @@ def _fetch_single_exp_chain(ticker_symbol, exp_str):
     return calls, puts
 
 def calculate_max_pain(calls, puts, w_col="openInterest"):
-    """计算最大痛点 (Max Pain)：使买方到期总收益最小的行权价"""
     if calls.empty and puts.empty:
         return np.nan
     strikes = np.sort(np.unique(np.concatenate([
@@ -623,19 +695,16 @@ def calculate_max_pain(calls, puts, w_col="openInterest"):
     p_k = puts["strike"].values if not puts.empty else np.array([])
     p_w = puts[w_col].values if not puts.empty else np.array([])
 
-    min_pain = float("inf")
-    best_strike = np.nan
+    min_pain, best_strike = float("inf"), np.nan
     for s in strikes:
         c_pain = np.sum(np.maximum(0.0, s - c_k) * c_w) if len(c_k) > 0 else 0.0
         p_pain = np.sum(np.maximum(0.0, p_k - s) * p_w) if len(p_k) > 0 else 0.0
-        total_pain = c_pain + p_pain
-        if total_pain < min_pain:
-            min_pain = total_pain
+        if (c_pain + p_pain) < min_pain:
+            min_pain = c_pain + p_pain
             best_strike = float(s)
     return best_strike
 
 def do_fetch_option_details(ticker_symbol, exp_list_target, fallback_current_price):
-    """支持单到期日或近 N 期汇总 GEX、Walls、Gamma Flip 与 Max Pain"""
     calls_disp, puts_disp, gex_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     call_wall, put_wall, gamma_flip, max_pain = np.nan, np.nan, np.nan, np.nan
     pcr_oi, pcr_vol, atm_iv, move_1d, move_exp = np.nan, np.nan, np.nan, np.nan, np.nan
@@ -664,7 +733,6 @@ def do_fetch_option_details(ticker_symbol, exp_list_target, fallback_current_pri
                     df = df[(df["strike"] >= current_price * 0.3) & (df["strike"] <= current_price * 2.5)].copy()
                     bucket.append(df)
 
-            # 第一个到期日用于 ATM IV、预期波幅与明细展示
             if idx == 0 and (not c_raw.empty or not p_raw.empty):
                 c0 = all_calls_list[0] if all_calls_list else pd.DataFrame()
                 p0 = all_puts_list[0] if all_puts_list else pd.DataFrame()
@@ -708,7 +776,6 @@ def do_fetch_option_details(ticker_symbol, exp_list_target, fallback_current_pri
             w_col, calc_mode = None, "无有效持仓/成交"
 
         if w_col:
-            # 按行权价汇总求 Walls 与 Max Pain
             c_grp = calls.groupby("strike", as_index=False)[w_col].sum() if not calls.empty else pd.DataFrame(columns=["strike", w_col])
             p_grp = puts.groupby("strike", as_index=False)[w_col].sum() if not puts.empty else pd.DataFrame(columns=["strike", w_col])
 
@@ -721,7 +788,6 @@ def do_fetch_option_details(ticker_symbol, exp_list_target, fallback_current_pri
 
             max_pain = calculate_max_pain(c_grp, p_grp, w_col)
 
-            # 计算各行权价汇总 Dollar GEX ($M)
             valid_calls = calls[calls["iv_valid"] & (calls[w_col] > 0)].copy() if not calls.empty else pd.DataFrame()
             valid_puts = puts[puts["iv_valid"] & (puts[w_col] > 0)].copy() if not puts.empty else pd.DataFrame()
 
@@ -748,7 +814,6 @@ def do_fetch_option_details(ticker_symbol, exp_list_target, fallback_current_pri
             if gex_df.empty:
                 gex_df = gex_merged.sort_values("strike").reset_index(drop=True)
 
-            # 计算 Gamma Flip
             s_range = np.linspace(current_price * 0.75, current_price * 1.25, 90)
             net_gammas = []
             for s_test in s_range:
@@ -802,10 +867,62 @@ def plot_gex_chart(gex_df, current_price, gamma_flip, max_pain, ticker, title_su
     return fig
 
 # ==========================================
-# 🧠 9. 综合量化诊断与操作建议引擎
+# 🧠 9. 直观结论、盘前/盘中信号与交易计划引擎
 # ==========================================
+def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
+    """输出盘前走势预估、盘中实时信号与即时操作提示"""
+    signals = []
+    action_tip = "观望为主，等待价格靠近关键支撑/阻力或 VWAP 再行动。"
+    price = snap["live_price"]
+    gap = snap["gap_pct"]
+    now_et = datetime.now(US_EASTERN_TZ)
+    t_min = now_et.hour * 60 + now_et.minute
+    is_premarket = t_min < 570
+
+    # 1. 盘前预判
+    if is_premarket:
+        if abs(gap) >= 2.0:
+            direction = "大幅高开" if gap > 0 else "大幅低开"
+            signals.append(f"🌅 **盘前异动 ({direction} {gap:+.2f}%)**：开盘前 15 分钟波动剧烈，避免市价追单。")
+        if avg_daily_vol > 0 and snap["pre_vol"] > avg_daily_vol * 0.08:
+            signals.append(f"🔥 **盘前显著放量**：已成交 {snap['pre_vol']:,} 股（超日均量 8%），今日大概率走单边趋势。")
+
+    # 2. 盘中 VWAP & ORB 突破
+    if not is_premarket:
+        if pd.notnull(snap["vwap"]):
+            if price > snap["vwap"] * 1.002:
+                signals.append(f"🟢 **站稳机构 VWAP (${snap['vwap']:.2f})**：日内买盘主导，回踩 VWAP 企稳可顺势低吸。")
+                action_tip = f"顺势偏多：以 VWAP (${snap['vwap']:.2f}) 作为日内多头防守线。"
+            elif price < snap["vwap"] * 0.998:
+                signals.append(f"🔴 **受制于 VWAP (${snap['vwap']:.2f})**：日内空头占优，反抽不过 VWAP 警惕继续下探。")
+                action_tip = f"防守偏空：未重新站回 VWAP (${snap['vwap']:.2f}) 前不宜重仓抄底。"
+
+        if pd.notnull(snap["orb_high"]) and t_min >= 585:
+            if price > snap["orb_high"]:
+                signals.append(f"🚀 **突破开盘 15 分钟高点 (ORB ${snap['orb_high']:.2f})**：日内多头突破确立。")
+            elif price < snap["orb_low"]:
+                signals.append(f"📉 **跌破开盘 15 分钟低点 (ORB ${snap['orb_low']:.2f})**：日内弱势破位。")
+
+    # 3. 现价与期权墙位联动
+    if opt_data:
+        _, _, cw, pw, gf, _, _, _, _, _, _, _, _, _ = opt_data
+        if pd.notnull(cw) and price >= cw * 0.992:
+            if price > cw:
+                signals.append(f"🔥 **已突破 Call Wall (${cw:.2f})**：触发正伽马逼空区间，注意移动止盈保护利润。")
+            else:
+                signals.append(f"🧱 **逼近 Call Wall (${cw:.2f})**：上方强阻力区，谨防冲高回落，适合分批止盈。")
+        if pd.notnull(pw) and abs(price - pw) / price <= 0.008:
+            signals.append(f"🛡️ **回踩 Put Wall (${pw:.2f})**：机构强支撑区，留意放量止跌的左侧/右侧买点。")
+        if pd.notnull(gf):
+            if is_premarket and price < gf:
+                signals.append(f"⚠️ **盘前位于 Gamma Flip (${gf:.2f}) 下方**：今日将处于负伽马高波动环境，谨防急跌。")
+            elif abs(price - gf) / price <= 0.006:
+                signals.append(f"🌀 **正处 Gamma Flip (${gf:.2f}) 变盘临界点**：即将决定今日是稳步震荡还是加速波动。")
+
+    return signals, action_tip
+
 def generate_quant_diagnosis(ticker, hist_df, dp_df, mkt, opt_data):
-    """融合趋势、暗池、GEX、波动率与财报风险，输出直观判断与策略建议"""
+    """融合趋势、暗池、GEX、波动率与财报风险，输出直观结论与可执行建议"""
     last = hist_df.iloc[-1]
     price = float(last["Close"])
     ma5, ma20, mfi = float(last["MA5"]), float(last["MA20"]), float(last["MFI"])
@@ -813,73 +930,79 @@ def generate_quant_diagnosis(ticker, hist_df, dp_df, mkt, opt_data):
     earnings_date = mkt.get("earnings_date")
 
     score = 0
-    bullets = []
-    warnings = []
+    bullets, warnings = [], []
+    support_ref, resist_ref = last["Lower"], last["Upper"]
+    opt_strategy = "数据不足，建议以正股仓位管理为主。"
 
-    # 1. 趋势与均线结构
+    # 1. 趋势结构
     if pd.notnull(ma20) and pd.notnull(ma5):
         if price > ma5 > ma20:
             score += 2
-            bullets.append(f"📈 **趋势偏多**：现价 (${price:.2f}) 站稳 MA5 (${ma5:.2f}) 与 MA20 (${ma20:.2f}) 上方，短中期处于多头排列。")
+            bullets.append(f"📈 **趋势偏多**：现价 (${price:.2f}) 位于 MA5 (${ma5:.2f}) 和 MA20 (${ma20:.2f}) 上方，短中期多头排列。")
         elif price < ma5 < ma20:
             score -= 2
-            bullets.append(f"📉 **趋势偏空**：现价跌破 MA5 与 MA20，短线处于弱势下跌通道，切忌盲目左侧重仓抄底。")
+            bullets.append(f"📉 **趋势偏空**：现价跌破 MA5 与 MA20，处于弱势通道，不宜盲目左侧重仓。")
         else:
-            bullets.append(f"⚖️ **震荡整理**：均线交织，现价在 MA20 (${ma20:.2f}) 附近拉锯，适合高抛低吸而非追涨杀跌。")
+            bullets.append(f"⚖️ **震荡整理**：均线交织，现价围绕 MA20 (${ma20:.2f}) 震荡，适合区间高抛低吸。")
 
-    # 2. 期权 GEX 与关键墙位
+    # 2. 期权 GEX 与 IV/HV 定价
     if opt_data:
         _, _, call_wall, put_wall, gamma_flip, max_pain, pcr_oi, _, _, _, atm_iv, _, _, _ = opt_data
+        if pd.notnull(call_wall):
+            resist_ref = call_wall
+        if pd.notnull(put_wall):
+            support_ref = put_wall
+
         if pd.notnull(gamma_flip):
             if price >= gamma_flip:
                 score += 1
-                bullets.append(f"🟢 **正伽马环境 (现价 ≥ Flip ${gamma_flip:.2f})**：做市商倾向高抛低吸抑制波动，行情偏向稳步震荡或缓涨，适合依托支撑位低吸。")
+                bullets.append(f"🟢 **正伽马环境 (现价 ≥ Flip ${gamma_flip:.2f})**：做市商高抛低吸抑制波动，适合依托支撑位逢低布局。")
             else:
                 score -= 1
-                warnings.append(f"🔴 **负伽马环境 (现价 < Flip ${gamma_flip:.2f})**：做市商对冲会放大日内波动，容易出现急跌或剧烈洗盘，务必严控仓位与止损。")
-
-        if pd.notnull(call_wall) and pd.notnull(put_wall):
-            dist_c = (call_wall / price - 1) * 100
-            dist_p = (1 - put_wall / price) * 100
-            bullets.append(f"🧱 **核心博弈区间**：上方强阻力 **Call Wall ${call_wall:.2f}** (+{dist_c:.1f}%)，下方强支撑 **Put Wall ${put_wall:.2f}** (-{dist_p:.1f}%)。")
+                warnings.append(f"🔴 **负伽马环境 (现价 < Flip ${gamma_flip:.2f})**：做市商对冲会放大日内波动，容易急跌洗盘，务必严控止损。")
 
         if pd.notnull(atm_iv) and pd.notnull(hv20) and hv20 > 0:
             iv_hv = atm_iv / hv20
             if iv_hv > 1.25:
-                bullets.append(f"💰 **波动率溢价偏高 (IV {atm_iv:.0%} vs HV20 {hv20:.0%})**：期权定价偏贵，**不利于单边买期权 (Long)**，更适合卖方策略 (如 Covered Call / 卖 Put 收租)。")
+                opt_strategy = f"期权溢价偏高 (IV {atm_iv:.0%} > HV20 {hv20:.0%})，**忌裸买期权**，优先考虑卖方策略 (如在 ${resist_ref:.2f} 附近卖 Covered Call 或在 ${support_ref:.2f} 附近卖 Cash-Secured Put)。"
             elif iv_hv < 0.85:
-                bullets.append(f"🎯 **波动率偏低 (IV {atm_iv:.0%} vs HV20 {hv20:.0%})**：期权定价便宜，若判断有方向性突破，**买方期权盈亏比较高**。")
+                opt_strategy = f"期权定价便宜 (IV {atm_iv:.0%} < HV20 {hv20:.0%})，若放量突破关键位，**买方期权 (Long Call/Put) 盈亏比较高**。"
+            else:
+                opt_strategy = f"期权定价中性 (IV {atm_iv:.0%} ≈ HV20 {hv20:.0%})，可采用垂直价差 (Vertical Spread) 控制成本。"
 
-    # 3. FINRA 暗池与 MFI 资金流
+    # 3. FINRA 暗池与 MFI
     if dp_df is not None and not dp_df.empty:
         sr = float(dp_df["暗池做空占比%"].iloc[0])
         if sr >= 55:
             score -= 1
-            bullets.append(f"🌑 **暗池抛压偏重**：最新 FINRA 暗池做空占比达 **{sr:.1f}%**，场外机构存在明显对冲或派发迹象，拉升时注意减仓。")
+            bullets.append(f"🌑 **暗池抛压偏重**：最新暗池做空占比 **{sr:.1f}%**，机构存在明显对冲或派发，反弹至阻力位建议减仓。")
         elif sr <= 42:
             score += 1
-            bullets.append(f"🌑 **暗池买盘承接强**：最新 FINRA 暗池做空占比仅 **{sr:.1f}%**，场外机构偏多承接，回调空间相对受限。")
+            bullets.append(f"🌑 **暗池买盘承接强**：最新暗池做空占比仅 **{sr:.1f}%**，场外资金承接积极。")
 
     if mfi >= 80:
         warnings.append(f"⚠️ **资金流超买 (MFI={mfi:.1f})**：短线获利盘较重，警惕冲高回落。")
     elif mfi <= 20:
-        bullets.append(f"💡 **资金流超卖 (MFI={mfi:.1f})**：短线情绪冰点，存在技术性反弹动能。")
+        bullets.append(f"💡 **资金流超卖 (MFI={mfi:.1f})**：短线情绪冰点，留意超跌反弹。")
 
-    # 4. 财报事件风险
+    # 4. 财报风险
     if earnings_date:
         days_left = (earnings_date - datetime.now(US_EASTERN_TZ).date()).days
         if 0 <= days_left <= 7:
-            warnings.append(f"🚨 **财报倒计时预警**：距离下次财报 ({earnings_date}) 仅剩 **{days_left} 天**！面临跳空及 IV Crush 风险，建议降低杠杆或避开裸买末日期权。")
+            warnings.append(f"🚨 **财报倒计时预警**：距离财报 ({earnings_date}) 仅剩 **{days_left} 天**！面临跳空及 IV Crush 风险，建议降低杠杆。")
 
-    # 综合定性
+    # 综合结论与操作计划
     if score >= 2:
-        verdict, color = "🟢 偏多格局 · 逢低布局 / 持股待涨", "success"
+        verdict, color = "🟢 偏多格局 · 顺势低吸 / 持股待涨", "success"
+        stock_plan = f"依托 **${support_ref:.2f}** (强支撑) 分批布局，上方第一目标/减仓参考 **${resist_ref:.2f}**。"
     elif score <= -2:
         verdict, color = "🔴 偏空格局 · 防守为主 / 逢高减仓", "error"
+        stock_plan = f"反弹至 **${resist_ref:.2f}** 或 MA5 附近注意减仓，若有效跌破 **${support_ref:.2f}** 需果断止损。"
     else:
-        verdict, color = "🟡 震荡博弈 · 严守支撑阻力区间", "warning"
+        verdict, color = "🟡 震荡博弈 · 区间高抛低吸", "warning"
+        stock_plan = f"在 **${support_ref:.2f} ~ ${resist_ref:.2f}** 区间内做高抛低吸，未放量突破前不追涨杀跌。"
 
-    return verdict, color, bullets, warnings
+    return verdict, color, bullets, warnings, stock_plan, opt_strategy
 
 # ==========================================
 # 🔄 10. 后台守护线程
@@ -894,8 +1017,8 @@ def background_updater_loop():
                     data = do_fetch_stock_data(tk)
                     if data:
                         with GLOBAL_STORE["lock"]:
-                            GLOBAL_STORE["stock_cache"][f"v12_{tk}"] = data
-                            GLOBAL_STORE["fetch_timestamps"][f"v12_{tk}"] = data[3]["timestamp"]
+                            GLOBAL_STORE["stock_cache"][f"v13_{tk}"] = data
+                            GLOBAL_STORE["fetch_timestamps"][f"v13_{tk}"] = data[3]["timestamp"]
                 except Exception:
                     pass
                 time.sleep(2.5)
@@ -946,7 +1069,7 @@ with st.sidebar:
 
     if st.button("🔄 强制刷新当前标的"):
         with GLOBAL_STORE["lock"]:
-            GLOBAL_STORE["stock_cache"].pop(f"v12_{st.session_state.current_ticker}", None)
+            GLOBAL_STORE["stock_cache"].pop(f"v13_{st.session_state.current_ticker}", None)
             GLOBAL_STORE["darkpool_cache"].pop(f"dp_{st.session_state.current_ticker}", None)
             GLOBAL_STORE["intraday_cache"].pop(f"{st.session_state.current_ticker}_15m", None)
             GLOBAL_STORE["intraday_cache"].pop(f"{st.session_state.current_ticker}_60m", None)
@@ -961,8 +1084,8 @@ with tab_main:
     ticker = st.session_state.current_ticker
     st.title(f"🎯 {ticker} 专业量化决策终端 Pro")
 
-    stock_data = GLOBAL_STORE["stock_cache"].get(f"v12_{ticker}")
-    last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v12_{ticker}", 0)
+    stock_data = GLOBAL_STORE["stock_cache"].get(f"v13_{ticker}")
+    last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v13_{ticker}", 0)
     is_expired = (time.time() - last_ts) > get_dynamic_ttl()
 
     if not stock_data or is_expired:
@@ -971,8 +1094,8 @@ with tab_main:
             if fresh_data:
                 stock_data = fresh_data
                 with GLOBAL_STORE["lock"]:
-                    GLOBAL_STORE["stock_cache"][f"v12_{ticker}"] = fresh_data
-                    GLOBAL_STORE["fetch_timestamps"][f"v12_{ticker}"] = fresh_data[3]["timestamp"]
+                    GLOBAL_STORE["stock_cache"][f"v13_{ticker}"] = fresh_data
+                    GLOBAL_STORE["fetch_timestamps"][f"v13_{ticker}"] = fresh_data[3]["timestamp"]
                     GLOBAL_STORE["active_queue"].add(ticker)
 
     if not stock_data:
@@ -981,7 +1104,6 @@ with tab_main:
         hist_df, reg, dp_df, mkt = stock_data
         last = hist_df.iloc[-1]
 
-        # 换手率分母计算
         if manual_float > 0:
             eff_float, float_label = float(manual_float), "手动修正"
         elif float_mode == "流通股本 (Float)" and mkt["float_shares"]:
@@ -997,18 +1119,17 @@ with tab_main:
         hist_df = hist_df.copy()
         hist_df["换手率_raw"] = (hist_df["Volume"] / eff_float) if (eff_float and eff_float > 0) else np.nan
 
-        # 顶部宏观与现价栏
-        st.caption(f"🟢 **{ticker}** 数据抓取于 (北京时间): **{mkt['fetch_time']}** | 行情源: **{mkt['source']}**")
+        # 顶部宏观与现价
+        st.caption(f"🟢 **{ticker}** 主数据抓取于 (北京时间): **{mkt['fetch_time']}** | 行情源: **{mkt['source']}**")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Bitcoin", f"${mkt['btc']:,.0f}" if mkt["btc"] > 0 else "N/A")
         m2.metric("Nasdaq", f"{mkt['nasdaq']:,.2f}" if mkt["nasdaq"] > 0 else "N/A", f"{mkt['nasdaq_pct']:.2%}" if mkt["nasdaq"] > 0 else None)
         m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}" if mkt["vix"] > 0 else "N/A", f"{mkt['vix_pct']:.2%}" if mkt["vix"] > 0 else None, delta_color="inverse")
-        m4.metric(f"{ticker} 现价", f"${last['Close']:.2f}", f"{(last['Close']/last['昨收']-1):.2%}" if pd.notnull(last["昨收"]) else None)
+        m4.metric(f"{ticker} 收盘/现价", f"${last['Close']:.2f}", f"{(last['Close']/last['昨收']-1):.2%}" if pd.notnull(last["昨收"]) else None)
 
-        # 提前获取期权数据，供顶层诊断引擎 & K 线图叠加使用
+        # 控制栏：周期与期权维度
         exp_list = get_expiration_list(ticker)
-        opt_data = None
-        selected_exp_label = ""
+        opt_data, selected_exp_label = None, ""
         ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1.2, 1.2])
         with ctrl1:
             tf_choice = st.radio("📈 K线周期", ["1d (日线)", "60m (小时+VWAP)", "15m (15分+VWAP)"], horizontal=True)
@@ -1027,7 +1148,7 @@ with tab_main:
                     target_exps = [selected_exp]
                     selected_exp_label = selected_exp
 
-                opt_key = f"v12_{ticker}_{'_'.join(target_exps)}"
+                opt_key = f"v13_{ticker}_{'_'.join(target_exps)}"
                 opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
                 if not opt_data or is_expired:
                     with st.spinner("🕯️ 正在计算期权链与 GEX..."):
@@ -1037,14 +1158,46 @@ with tab_main:
             else:
                 st.caption("该标的暂无期权链")
 
-        # 🧠 综合量化诊断与操作建议面板
-        verdict, v_color, bullets, warnings = generate_quant_diagnosis(ticker, hist_df, dp_df, mkt, opt_data)
-        st.subheader("🧠 综合量化诊断与操作建议")
-        getattr(st, v_color)(f"**综合研判：{verdict}**")
+        # 📡 盘前/盘中局部自动刷新信号雷达 (@st.fragment)
+        refresh_sec = get_live_refresh_interval()
+
+        @st.fragment(run_every=refresh_sec)
+        def render_live_radar(ticker_sym, avg_vol, opt_snapshot):
+            snap = fetch_realtime_signal_snapshot(ticker_sym)
+            if not snap:
+                return
+            status_txt = f"自动刷新中 (每 {refresh_sec}s)" if refresh_sec else "非交易时段 (已暂停自动刷新)"
+            with st.container(border=True):
+                st.caption(f"📡 **盘前/盘中实时信号雷达** | 更新于 {snap['update_time']} (北京时间) | {status_txt}")
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("最新价 (含盘前/盘后)", f"${snap['live_price']:.2f}", f"{snap['gap_pct']:+.2f}%")
+                r2.metric("日内机构 VWAP", f"${snap['vwap']:.2f}" if pd.notnull(snap["vwap"]) else "未开盘")
+                r3.metric("开盘15分 ORB 区间", f"${snap['orb_low']:.2f} ~ ${snap['orb_high']:.2f}" if pd.notnull(snap["orb_high"]) else "等待09:45")
+                r4.metric("盘前成交量", f"{snap['pre_vol']:,}")
+
+                sigs, tip = evaluate_intraday_signals(snap, avg_vol, opt_snapshot)
+                st.info(f"⚡ **日内即时策略**：{tip}")
+                if sigs:
+                    for s in sigs:
+                        st.markdown(f"- {s}")
+                else:
+                    st.caption("当前暂无显著盘中异动信号，行情处于常规波动区间。")
+
+        avg_20d_vol = float(hist_df["Volume"].tail(20).mean())
+        render_live_radar(ticker, avg_20d_vol, opt_data)
+
+        # 🧠 综合量化诊断与可执行交易建议
+        verdict, v_color, bullets, warnings, stock_plan, opt_strategy = generate_quant_diagnosis(ticker, hist_df, dp_df, mkt, opt_data)
+        st.subheader("🧠 综合量化诊断与交易计划")
+        getattr(st, v_color)(f"**综合结论：{verdict}**")
+        p1, p2 = st.columns(2)
+        p1.markdown(f"🎯 **正股操作建议**：{stock_plan}")
+        p2.markdown(f"🕯️ **期权策略建议**：{opt_strategy}")
         for w in warnings:
             st.error(w)
-        for b in bullets:
-            st.markdown(f"- {b}")
+        with st.expander("📋 查看多维度数据诊断依据", expanded=True):
+            for b in bullets:
+                st.markdown(f"- {b}")
 
         st.divider()
 
@@ -1077,7 +1230,6 @@ with tab_main:
             else:
                 st.warning("分时数据拉取失败，请切回日线查看。")
 
-        # 在主 K 线图上叠加 Call Wall / Put Wall / Gamma Flip / Max Pain
         if opt_data:
             _, _, cw, pw, gf, mp, _, _, _, _, _, _, _, _ = opt_data
             if pd.notnull(cw):
@@ -1095,7 +1247,6 @@ with tab_main:
 
         st.divider()
 
-        # 实时指标 & 场景回归
         c1, c2 = st.columns([1, 1.4])
         with c1:
             st.subheader("📊 实时指标与波动率")
@@ -1125,7 +1276,6 @@ with tab_main:
 
         st.divider()
 
-        # 期权 GEX & FINRA 暗池
         o_col, d_col = st.columns([1.5, 1])
         with o_col:
             st.subheader("🕯️ 全景期权与 GEX 分析")
@@ -1202,13 +1352,13 @@ with tab_watch:
         rows_wl = []
         progress = st.progress(0)
         for idx, tk in enumerate(wl_tickers):
-            data = GLOBAL_STORE["stock_cache"].get(f"v12_{tk}")
+            data = GLOBAL_STORE["stock_cache"].get(f"v13_{tk}")
             if not data:
                 data = do_fetch_stock_data(tk)
                 if data:
                     with GLOBAL_STORE["lock"]:
-                        GLOBAL_STORE["stock_cache"][f"v12_{tk}"] = data
-                        GLOBAL_STORE["fetch_timestamps"][f"v12_{tk}"] = data[3]["timestamp"]
+                        GLOBAL_STORE["stock_cache"][f"v13_{tk}"] = data
+                        GLOBAL_STORE["fetch_timestamps"][f"v13_{tk}"] = data[3]["timestamp"]
             if data:
                 h_df, _, d_df, m = data
                 l_row = h_df.iloc[-1]
