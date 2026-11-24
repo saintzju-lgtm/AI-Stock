@@ -6,6 +6,7 @@ from sklearn.linear_model import LinearRegression
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
+import hmac
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import threading
@@ -15,17 +16,49 @@ from io import StringIO
 from curl_cffi import requests as cffi_requests
 
 # ==========================================
-# 0. 页面全局配置与时区定义
+# 0. 页面全局配置与密码门禁
 # ==========================================
 st.set_page_config(layout="wide", page_title="专业量化决策终端 Pro")
+
+def check_password():
+    """基于 st.secrets 的密码门禁，未通过验证直接中断后续所有加载"""
+    try:
+        secret_pwd = st.secrets.get("APP_PASSWORD", "")
+    except Exception:
+        secret_pwd = ""
+
+    if not secret_pwd:
+        st.sidebar.warning("⚠️ 未检测到 APP_PASSWORD，当前处于无密码模式。线上部署请在 Secrets 中配置。")
+        return True
+
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("🔒 专业量化决策终端 · 访问验证")
+    pwd = st.text_input("请输入访问密码", type="password")
+    if st.button("登录", type="primary"):
+        if hmac.compare_digest(pwd, str(secret_pwd)):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("密码错误，请重试。")
+    st.stop()
+
+check_password()
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 US_EASTERN_TZ = ZoneInfo("America/New_York")
 GLOBAL_RATE_INTERVAL = 0.8
 RISK_FREE_RATE = 0.045
 
+# 防刷安全参数
+MAX_CACHE_ITEMS = 30          # 单类缓存最多保留 30 只标的，防止内存溢出 (OOM)
+MAX_CALLS_PER_MIN = 45        # 全站每分钟最多发起 45 次外部行情请求，触发则熔断
+BUTTON_COOLDOWN_SEC = 60      # 强制刷新 & 自选股扫描按钮冷却时间 (秒)
+MAX_WATCHLIST_SCAN = 10       # 自选股单次最多扫描 10 只
+
 # ==========================================
-# 🧠 1. 全局解耦内存存储中心
+# 🧠 1. 全局解耦内存存储中心与防刷熔断器
 # ==========================================
 @st.cache_resource
 def get_global_data_store():
@@ -37,15 +70,34 @@ def get_global_data_store():
         "darkpool_cache": {},
         "macro_cache": {"data": None, "ts": 0.0},
         "fetch_timestamps": {},
-        "active_queue": set(["NVDA", "AAPL", "TSLA", "BTDR"]),
+        # 锁定后台核心刷新队列，不再接收外部任意输入，防止被脚本撑爆
+        "core_queue": ["NVDA", "AAPL", "TSLA", "BTDR"],
+        "call_history": [],
         "lock": threading.Lock(),
         "last_yahoo_call_ts": 0.0,
     }
 
 GLOBAL_STORE = get_global_data_store()
 
+def safe_cache_set(cache_dict, key, value, max_items=MAX_CACHE_ITEMS):
+    """带容量上限的线程安全缓存写入 (FIFO 淘汰)，彻底防止 OOM"""
+    with GLOBAL_STORE["lock"]:
+        if len(cache_dict) >= max_items and key not in cache_dict:
+            oldest_key = next(iter(cache_dict))
+            cache_dict.pop(oldest_key, None)
+        cache_dict[key] = value
+
+def check_global_rate_limit(max_calls=MAX_CALLS_PER_MIN):
+    """全局滑动窗口熔断器：防止并发脚本打爆服务器 IP"""
+    now = time.time()
+    with GLOBAL_STORE["lock"]:
+        GLOBAL_STORE["call_history"] = [t for t in GLOBAL_STORE["call_history"] if now - t < 60]
+        if len(GLOBAL_STORE["call_history"]) >= max_calls:
+            return False
+        GLOBAL_STORE["call_history"].append(now)
+        return True
+
 def get_dynamic_ttl():
-    """主数据缓存 TTL：交易时段 3 分钟，非交易时段 30 分钟"""
     now_et = datetime.now(US_EASTERN_TZ)
     if now_et.weekday() >= 5:
         return 1800
@@ -63,7 +115,7 @@ def get_live_refresh_interval():
     if 480 <= t_min < 570:      # 盘前 08:00 - 09:30
         return 60
     elif 570 <= t_min < 600:    # 开盘黄金30分 09:30 - 10:00
-        return 20
+        return 30
     elif 600 <= t_min < 900:    # 盘中常规 10:00 - 15:00
         return 60
     elif 900 <= t_min < 960:    # 尾盘 15:00 - 16:00
@@ -71,6 +123,8 @@ def get_live_refresh_interval():
     return None
 
 def _throttled_yahoo_call(func, max_retries=1):
+    if not check_global_rate_limit():
+        raise RuntimeError("触发全站频率熔断保护，请 1 分钟后再试")
     last_err = None
     for attempt in range(max_retries + 1):
         with GLOBAL_STORE["lock"]:
@@ -243,15 +297,15 @@ def fetch_finra_darkpool_data(ticker_symbol, lookback_days=7):
     if not df.empty:
         df = df.set_index("日期").sort_index(ascending=False).head(lookback_days)
 
-    with GLOBAL_STORE["lock"]:
-        GLOBAL_STORE["darkpool_cache"][cache_key] = {"df": df, "ts": time.time()}
+    safe_cache_set(GLOBAL_STORE["darkpool_cache"], cache_key, {"df": df, "ts": time.time()})
     return df
 
 # ==========================================
 # 🚀 5. K 线、盘前/盘中实时快照与宏观引擎
 # ==========================================
 def fetch_realtime_signal_snapshot(ticker_symbol):
-    """轻量级抓取：含盘前/盘中最新价、5分钟K线(算VWAP与ORB)、盘前成交量"""
+    if not check_global_rate_limit():
+        return None
     try:
         session = cffi_requests.Session(impersonate="chrome110")
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range=2d&interval=5m&includePrePost=true"
@@ -291,7 +345,7 @@ def fetch_realtime_signal_snapshot(ticker_symbol):
             vol_sum = reg_df["Volume"].sum()
             if vol_sum > 0:
                 vwap = float((tp * reg_df["Volume"]).sum() / vol_sum)
-            orb_df = reg_df.iloc[:3]  # 开盘前15分钟
+            orb_df = reg_df.iloc[:3]
             if len(orb_df) >= 1:
                 orb_high = float(orb_df["High"].max())
                 orb_low = float(orb_df["Low"].min())
@@ -311,6 +365,8 @@ def fetch_realtime_signal_snapshot(ticker_symbol):
         return None
 
 def fetch_chart_yahoo_direct(symbol):
+    if not check_global_rate_limit():
+        return pd.DataFrame(), ""
     try:
         session = cffi_requests.Session(impersonate="chrome110")
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range=120d&interval=1d&includePrePost=false"
@@ -371,6 +427,8 @@ def fetch_intraday_chart(symbol, interval="15m"):
     cached = GLOBAL_STORE["intraday_cache"].get(cache_key)
     if cached and (time.time() - cached["ts"] < 180):
         return cached["df"]
+    if not check_global_rate_limit():
+        return pd.DataFrame()
 
     rng = "5d" if interval == "15m" else "1mo"
     try:
@@ -402,8 +460,7 @@ def fetch_intraday_chart(symbol, interval="15m"):
             df["VWAP"] = (cum_tp_vol / cum_vol).ffill()
             df["MA20"] = df["Close"].rolling(20).mean()
 
-            with GLOBAL_STORE["lock"]:
-                GLOBAL_STORE["intraday_cache"][cache_key] = {"df": df, "ts": time.time()}
+            safe_cache_set(GLOBAL_STORE["intraday_cache"], cache_key, {"df": df, "ts": time.time()})
             return df
     except Exception:
         pass
@@ -613,6 +670,8 @@ def do_fetch_stock_data(ticker_symbol):
 # 🕯️ 8. 期权链、多到期日汇总 GEX 与 Max Pain 引擎
 # ==========================================
 def fetch_yahoo_options_raw(ticker_symbol, selected_exp=None):
+    if not check_global_rate_limit():
+        return None
     session = cffi_requests.Session(impersonate="chrome110")
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"}
     url_params = ""
@@ -661,8 +720,7 @@ def get_expiration_list(ticker_symbol):
         except Exception:
             exp_list = []
 
-    with GLOBAL_STORE["lock"]:
-        GLOBAL_STORE["exp_list_cache"][ticker_symbol] = {"list": exp_list, "ts": time.time()}
+    safe_cache_set(GLOBAL_STORE["exp_list_cache"], ticker_symbol, {"list": exp_list, "ts": time.time()})
     return exp_list
 
 def _fetch_single_exp_chain(ticker_symbol, exp_str):
@@ -758,7 +816,7 @@ def do_fetch_option_details(ticker_symbol, exp_list_target, fallback_current_pri
         puts = pd.concat(all_puts_list, ignore_index=True) if all_puts_list else pd.DataFrame()
 
         if calls.empty and puts.empty:
-            return calls_disp, puts_disp, call_wall, put_wall, gamma_flip, max_pain, pcr_oi, pcr_vol, "无数据", "未获取到有效期权报价", atm_iv, move_1d, move_exp, gex_df
+            return calls_disp, puts_disp, call_wall, put_wall, gamma_flip, max_pain, pcr_oi, pcr_vol, "无数据", "未获取到有效期权报价(可能被限流或流动性不足)", atm_iv, move_1d, move_exp, gex_df
 
         tot_c_oi = calls["openInterest"].sum() if not calls.empty else 0.0
         tot_p_oi = puts["openInterest"].sum() if not puts.empty else 0.0
@@ -870,7 +928,6 @@ def plot_gex_chart(gex_df, current_price, gamma_flip, max_pain, ticker, title_su
 # 🧠 9. 直观结论、盘前/盘中信号与交易计划引擎
 # ==========================================
 def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
-    """输出盘前走势预估、盘中实时信号与即时操作提示"""
     signals = []
     action_tip = "观望为主，等待价格靠近关键支撑/阻力或 VWAP 再行动。"
     price = snap["live_price"]
@@ -879,7 +936,6 @@ def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
     t_min = now_et.hour * 60 + now_et.minute
     is_premarket = t_min < 570
 
-    # 1. 盘前预判
     if is_premarket:
         if abs(gap) >= 2.0:
             direction = "大幅高开" if gap > 0 else "大幅低开"
@@ -887,7 +943,6 @@ def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
         if avg_daily_vol > 0 and snap["pre_vol"] > avg_daily_vol * 0.08:
             signals.append(f"🔥 **盘前显著放量**：已成交 {snap['pre_vol']:,} 股（超日均量 8%），今日大概率走单边趋势。")
 
-    # 2. 盘中 VWAP & ORB 突破
     if not is_premarket:
         if pd.notnull(snap["vwap"]):
             if price > snap["vwap"] * 1.002:
@@ -903,7 +958,6 @@ def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
             elif price < snap["orb_low"]:
                 signals.append(f"📉 **跌破开盘 15 分钟低点 (ORB ${snap['orb_low']:.2f})**：日内弱势破位。")
 
-    # 3. 现价与期权墙位联动
     if opt_data:
         _, _, cw, pw, gf, _, _, _, _, _, _, _, _, _ = opt_data
         if pd.notnull(cw) and price >= cw * 0.992:
@@ -912,7 +966,7 @@ def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
             else:
                 signals.append(f"🧱 **逼近 Call Wall (${cw:.2f})**：上方强阻力区，谨防冲高回落，适合分批止盈。")
         if pd.notnull(pw) and abs(price - pw) / price <= 0.008:
-            signals.append(f"🛡️ **回踩 Put Wall (${pw:.2f})**：机构强支撑区，留意放量止跌的左侧/右侧买点。")
+            signals.append(f"🛡️ **回踩 Put Wall (${pw:.2f})**：机构强支撑区，留意放量止跌的买点。")
         if pd.notnull(gf):
             if is_premarket and price < gf:
                 signals.append(f"⚠️ **盘前位于 Gamma Flip (${gf:.2f}) 下方**：今日将处于负伽马高波动环境，谨防急跌。")
@@ -922,7 +976,6 @@ def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
     return signals, action_tip
 
 def generate_quant_diagnosis(ticker, hist_df, dp_df, mkt, opt_data):
-    """融合趋势、暗池、GEX、波动率与财报风险，输出直观结论与可执行建议"""
     last = hist_df.iloc[-1]
     price = float(last["Close"])
     ma5, ma20, mfi = float(last["MA5"]), float(last["MA20"]), float(last["MFI"])
@@ -934,7 +987,6 @@ def generate_quant_diagnosis(ticker, hist_df, dp_df, mkt, opt_data):
     support_ref, resist_ref = last["Lower"], last["Upper"]
     opt_strategy = "数据不足，建议以正股仓位管理为主。"
 
-    # 1. 趋势结构
     if pd.notnull(ma20) and pd.notnull(ma5):
         if price > ma5 > ma20:
             score += 2
@@ -945,7 +997,6 @@ def generate_quant_diagnosis(ticker, hist_df, dp_df, mkt, opt_data):
         else:
             bullets.append(f"⚖️ **震荡整理**：均线交织，现价围绕 MA20 (${ma20:.2f}) 震荡，适合区间高抛低吸。")
 
-    # 2. 期权 GEX 与 IV/HV 定价
     if opt_data:
         _, _, call_wall, put_wall, gamma_flip, max_pain, pcr_oi, _, _, _, atm_iv, _, _, _ = opt_data
         if pd.notnull(call_wall):
@@ -970,7 +1021,6 @@ def generate_quant_diagnosis(ticker, hist_df, dp_df, mkt, opt_data):
             else:
                 opt_strategy = f"期权定价中性 (IV {atm_iv:.0%} ≈ HV20 {hv20:.0%})，可采用垂直价差 (Vertical Spread) 控制成本。"
 
-    # 3. FINRA 暗池与 MFI
     if dp_df is not None and not dp_df.empty:
         sr = float(dp_df["暗池做空占比%"].iloc[0])
         if sr >= 55:
@@ -985,13 +1035,11 @@ def generate_quant_diagnosis(ticker, hist_df, dp_df, mkt, opt_data):
     elif mfi <= 20:
         bullets.append(f"💡 **资金流超卖 (MFI={mfi:.1f})**：短线情绪冰点，留意超跌反弹。")
 
-    # 4. 财报风险
     if earnings_date:
         days_left = (earnings_date - datetime.now(US_EASTERN_TZ).date()).days
         if 0 <= days_left <= 7:
             warnings.append(f"🚨 **财报倒计时预警**：距离财报 ({earnings_date}) 仅剩 **{days_left} 天**！面临跳空及 IV Crush 风险，建议降低杠杆。")
 
-    # 综合结论与操作计划
     if score >= 2:
         verdict, color = "🟢 偏多格局 · 顺势低吸 / 持股待涨", "success"
         stock_plan = f"依托 **${support_ref:.2f}** (强支撑) 分批布局，上方第一目标/减仓参考 **${resist_ref:.2f}**。"
@@ -1005,23 +1053,20 @@ def generate_quant_diagnosis(ticker, hist_df, dp_df, mkt, opt_data):
     return verdict, color, bullets, warnings, stock_plan, opt_strategy
 
 # ==========================================
-# 🔄 10. 后台守护线程
+# 🔄 10. 后台守护线程 (仅刷新锁定核心队列)
 # ==========================================
 def background_updater_loop():
     while True:
         try:
-            with GLOBAL_STORE["lock"]:
-                tickers_to_process = list(GLOBAL_STORE["active_queue"])
-            for tk in tickers_to_process:
+            for tk in GLOBAL_STORE["core_queue"]:
                 try:
                     data = do_fetch_stock_data(tk)
                     if data:
-                        with GLOBAL_STORE["lock"]:
-                            GLOBAL_STORE["stock_cache"][f"v13_{tk}"] = data
-                            GLOBAL_STORE["fetch_timestamps"][f"v13_{tk}"] = data[3]["timestamp"]
+                        safe_cache_set(GLOBAL_STORE["stock_cache"], f"v14_{tk}", data)
+                        safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v14_{tk}", data[3]["timestamp"])
                 except Exception:
                     pass
-                time.sleep(2.5)
+                time.sleep(3.0)
         except Exception:
             pass
         time.sleep(get_dynamic_ttl())
@@ -1049,8 +1094,6 @@ with st.sidebar:
     direct_input = st.text_input("直接输入任意代码 (回车生效)", placeholder="如: PLTR, MSTR, SOXL, BRK-B").strip().upper()
     if direct_input and direct_input != st.session_state.current_ticker:
         st.session_state.current_ticker = direct_input
-        with GLOBAL_STORE["lock"]:
-            GLOBAL_STORE["active_queue"].add(direct_input)
         st.rerun()
 
     default_idx = next((i for i, item in enumerate(STOCK_LIBRARY) if item.startswith(st.session_state.current_ticker + " -")), 0)
@@ -1058,22 +1101,36 @@ with st.sidebar:
     new_tk = selected_item.split(" - ")[0].strip()
     if new_tk and new_tk != st.session_state.current_ticker and not direct_input:
         st.session_state.current_ticker = new_tk
-        with GLOBAL_STORE["lock"]:
-            GLOBAL_STORE["active_queue"].add(new_tk)
         st.rerun()
+
+    st.divider()
+    st.subheader("⚙️ 刷新与防刷设置")
+    auto_refresh_on = st.toggle("📡 开启盘前/盘中自动刷新", value=False, help="默认关闭以节省额度，盯盘时可手动开启")
+
+    if st.button("🔄 强制刷新当前标的"):
+        now = time.time()
+        last_ref = st.session_state.get("last_manual_refresh", 0)
+        if now - last_ref < BUTTON_COOLDOWN_SEC:
+            st.warning(f"刷新冷却中，请 {int(BUTTON_COOLDOWN_SEC - (now - last_ref))} 秒后再试。")
+        else:
+            st.session_state["last_manual_refresh"] = now
+            with GLOBAL_STORE["lock"]:
+                GLOBAL_STORE["stock_cache"].pop(f"v14_{st.session_state.current_ticker}", None)
+                GLOBAL_STORE["darkpool_cache"].pop(f"dp_{st.session_state.current_ticker}", None)
+                GLOBAL_STORE["intraday_cache"].pop(f"{st.session_state.current_ticker}_15m", None)
+                GLOBAL_STORE["intraday_cache"].pop(f"{st.session_state.current_ticker}_60m", None)
+            st.rerun()
 
     st.divider()
     st.subheader("📐 换手率口径设置")
     float_mode = st.radio("默认分母口径", ["流通股本 (Float)", "总股本 (Outstanding)"], index=0)
     manual_float = st.number_input(f"{st.session_state.current_ticker} 手动修正股本 (留0自动)", min_value=0, value=0, step=1000000)
 
-    if st.button("🔄 强制刷新当前标的"):
-        with GLOBAL_STORE["lock"]:
-            GLOBAL_STORE["stock_cache"].pop(f"v13_{st.session_state.current_ticker}", None)
-            GLOBAL_STORE["darkpool_cache"].pop(f"dp_{st.session_state.current_ticker}", None)
-            GLOBAL_STORE["intraday_cache"].pop(f"{st.session_state.current_ticker}_15m", None)
-            GLOBAL_STORE["intraday_cache"].pop(f"{st.session_state.current_ticker}_60m", None)
-        st.rerun()
+    # 实时展示系统安全状态
+    with GLOBAL_STORE["lock"]:
+        cur_calls = len([t for t in GLOBAL_STORE["call_history"] if time.time() - t < 60])
+        cur_cached = len(GLOBAL_STORE["stock_cache"])
+    st.caption(f"🛡️ 防刷状态：近1分请求 {cur_calls}/{MAX_CALLS_PER_MIN} | 缓存 {cur_cached}/{MAX_CACHE_ITEMS}")
 
 tab_main, tab_watch = st.tabs(["📊 个股深度决策终端", "🔭 自选股监控大屏"])
 
@@ -1084,8 +1141,8 @@ with tab_main:
     ticker = st.session_state.current_ticker
     st.title(f"🎯 {ticker} 专业量化决策终端 Pro")
 
-    stock_data = GLOBAL_STORE["stock_cache"].get(f"v13_{ticker}")
-    last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v13_{ticker}", 0)
+    stock_data = GLOBAL_STORE["stock_cache"].get(f"v14_{ticker}")
+    last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v14_{ticker}", 0)
     is_expired = (time.time() - last_ts) > get_dynamic_ttl()
 
     if not stock_data or is_expired:
@@ -1093,13 +1150,11 @@ with tab_main:
             fresh_data = do_fetch_stock_data(ticker)
             if fresh_data:
                 stock_data = fresh_data
-                with GLOBAL_STORE["lock"]:
-                    GLOBAL_STORE["stock_cache"][f"v13_{ticker}"] = fresh_data
-                    GLOBAL_STORE["fetch_timestamps"][f"v13_{ticker}"] = fresh_data[3]["timestamp"]
-                    GLOBAL_STORE["active_queue"].add(ticker)
+                safe_cache_set(GLOBAL_STORE["stock_cache"], f"v14_{ticker}", fresh_data)
+                safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v14_{ticker}", fresh_data[3]["timestamp"])
 
     if not stock_data:
-        st.error(f"⚠️ 无法拉取 **{ticker}** 的数据，请检查代码是否正确（如 BRK.B 请写为 BRK-B）。")
+        st.error(f"⚠️ 无法拉取 **{ticker}** 的数据（可能代码有误、数据源波动，或触发了全站频率熔断保护，请稍后再试）。")
     else:
         hist_df, reg, dp_df, mkt = stock_data
         last = hist_df.iloc[-1]
@@ -1119,7 +1174,6 @@ with tab_main:
         hist_df = hist_df.copy()
         hist_df["换手率_raw"] = (hist_df["Volume"] / eff_float) if (eff_float and eff_float > 0) else np.nan
 
-        # 顶部宏观与现价
         st.caption(f"🟢 **{ticker}** 主数据抓取于 (北京时间): **{mkt['fetch_time']}** | 行情源: **{mkt['source']}**")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Bitcoin", f"${mkt['btc']:,.0f}" if mkt["btc"] > 0 else "N/A")
@@ -1127,7 +1181,6 @@ with tab_main:
         m3.metric("VIX 恐慌指数", f"{mkt['vix']:.2f}" if mkt["vix"] > 0 else "N/A", f"{mkt['vix_pct']:.2%}" if mkt["vix"] > 0 else None, delta_color="inverse")
         m4.metric(f"{ticker} 收盘/现价", f"${last['Close']:.2f}", f"{(last['Close']/last['昨收']-1):.2%}" if pd.notnull(last["昨收"]) else None)
 
-        # 控制栏：周期与期权维度
         exp_list = get_expiration_list(ticker)
         opt_data, selected_exp_label = None, ""
         ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1.2, 1.2])
@@ -1148,25 +1201,24 @@ with tab_main:
                     target_exps = [selected_exp]
                     selected_exp_label = selected_exp
 
-                opt_key = f"v13_{ticker}_{'_'.join(target_exps)}"
+                opt_key = f"v14_{ticker}_{'_'.join(target_exps)}"
                 opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
                 if not opt_data or is_expired:
                     with st.spinner("🕯️ 正在计算期权链与 GEX..."):
                         opt_data = do_fetch_option_details(ticker, target_exps, last["Close"])
-                        with GLOBAL_STORE["lock"]:
-                            GLOBAL_STORE["options_cache"][opt_key] = opt_data
+                        safe_cache_set(GLOBAL_STORE["options_cache"], opt_key, opt_data)
             else:
                 st.caption("该标的暂无期权链")
 
-        # 📡 盘前/盘中局部自动刷新信号雷达 (@st.fragment)
-        refresh_sec = get_live_refresh_interval()
+        # 📡 盘前/盘中局部自动刷新信号雷达
+        refresh_sec = get_live_refresh_interval() if auto_refresh_on else None
 
         @st.fragment(run_every=refresh_sec)
         def render_live_radar(ticker_sym, avg_vol, opt_snapshot):
             snap = fetch_realtime_signal_snapshot(ticker_sym)
             if not snap:
                 return
-            status_txt = f"自动刷新中 (每 {refresh_sec}s)" if refresh_sec else "非交易时段 (已暂停自动刷新)"
+            status_txt = f"自动刷新中 (每 {refresh_sec}s)" if refresh_sec else "手动模式 (可在左侧开启盘中自动刷新)"
             with st.container(border=True):
                 st.caption(f"📡 **盘前/盘中实时信号雷达** | 更新于 {snap['update_time']} (北京时间) | {status_txt}")
                 r1, r2, r3, r4 = st.columns(4)
@@ -1201,7 +1253,7 @@ with tab_main:
 
         st.divider()
 
-        # 📈 主 K 线图 (支持多周期 + VWAP + 期权墙位叠加)
+        # 📈 主 K 线图
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.72, 0.28])
         if tf_choice.startswith("1d"):
             p_df = hist_df.tail(50).copy()
@@ -1228,7 +1280,7 @@ with tab_main:
                 colors = ["#E53935" if p_df["Close"].iloc[i] >= p_df["Open"].iloc[i] else "#43A047" for i in range(len(p_df))]
                 fig.add_trace(go.Bar(x=p_df["label"], y=p_df["Volume"] / 10000, marker_color=colors, name="成交量(万股)"), row=2, col=1)
             else:
-                st.warning("分时数据拉取失败，请切回日线查看。")
+                st.warning("分时数据拉取失败或触发频率限制，请稍后重试或切回日线查看。")
 
         if opt_data:
             _, _, cw, pw, gf, mp, _, _, _, _, _, _, _, _ = opt_data
@@ -1340,58 +1392,66 @@ with tab_main:
         ), use_container_width=True)
 
 # ==========================================
-# TAB 2: 自选股监控大屏
+# TAB 2: 自选股监控大屏 (带冷却与数量上限)
 # ==========================================
 with tab_watch:
     st.title("🔭 自选股多标的监控大屏")
-    wl_input = st.text_input("编辑自选股列表 (用英文逗号分隔)", value=", ".join(st.session_state.watchlist))
-    wl_tickers = [t.strip().upper() for t in wl_input.split(",") if t.strip()]
+    wl_input = st.text_input(f"编辑自选股列表 (用英文逗号分隔，最多扫描前 {MAX_WATCHLIST_SCAN} 只)", value=", ".join(st.session_state.watchlist))
+    wl_tickers = [t.strip().upper() for t in wl_input.split(",") if t.strip()][:MAX_WATCHLIST_SCAN]
     st.session_state.watchlist = wl_tickers
 
     if st.button("🚀 一键扫描自选股", type="primary"):
-        rows_wl = []
-        progress = st.progress(0)
-        for idx, tk in enumerate(wl_tickers):
-            data = GLOBAL_STORE["stock_cache"].get(f"v13_{tk}")
-            if not data:
-                data = do_fetch_stock_data(tk)
+        now = time.time()
+        last_scan = st.session_state.get("last_wl_scan", 0)
+        if now - last_scan < BUTTON_COOLDOWN_SEC:
+            st.warning(f"扫描冷却中，请 {int(BUTTON_COOLDOWN_SEC - (now - last_scan))} 秒后再试。")
+        else:
+            st.session_state["last_wl_scan"] = now
+            rows_wl = []
+            progress = st.progress(0)
+            for idx, tk in enumerate(wl_tickers):
+                data = GLOBAL_STORE["stock_cache"].get(f"v14_{tk}")
+                if not data:
+                    data = do_fetch_stock_data(tk)
+                    if data:
+                        safe_cache_set(GLOBAL_STORE["stock_cache"], f"v14_{tk}", data)
+                        safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v14_{tk}", data[3]["timestamp"])
                 if data:
-                    with GLOBAL_STORE["lock"]:
-                        GLOBAL_STORE["stock_cache"][f"v13_{tk}"] = data
-                        GLOBAL_STORE["fetch_timestamps"][f"v13_{tk}"] = data[3]["timestamp"]
-            if data:
-                h_df, _, d_df, m = data
-                l_row = h_df.iloc[-1]
-                chg = (l_row["Close"] / l_row["昨收"] - 1) * 100 if pd.notnull(l_row["昨收"]) else 0.0
-                cap = m["float_shares"] or m["shares_out"]
-                _, proj_to, _ = calculate_turnover_metrics(m["volume"], cap, m["timestamp"])
-                dp_sr = float(d_df["暗池做空占比%"].iloc[0]) if (d_df is not None and not d_df.empty) else np.nan
-                trend = "🟢 多头" if (l_row["Close"] > l_row["MA5"] > l_row["MA20"]) else ("🔴 空头" if (l_row["Close"] < l_row["MA5"] < l_row["MA20"]) else "🟡 震荡")
-                rows_wl.append({
-                    "代码": tk,
-                    "现价($)": round(float(l_row["Close"]), 2),
-                    "涨跌幅%": round(chg, 2),
-                    "趋势结构": trend,
-                    "预估换手%": round(proj_to, 2) if cap else np.nan,
-                    "MFI(14)": round(float(l_row["MFI"]), 1),
-                    "HV20%": round(m["hv20"] * 100, 1) if pd.notnull(m["hv20"]) else np.nan,
-                    "暗池做空%": dp_sr,
-                    "下次财报": str(m["earnings_date"]) if m["earnings_date"] else "-",
-                })
-            progress.progress((idx + 1) / max(len(wl_tickers), 1))
+                    h_df, _, d_df, m = data
+                    l_row = h_df.iloc[-1]
+                    chg = (l_row["Close"] / l_row["昨收"] - 1) * 100 if pd.notnull(l_row["昨收"]) else 0.0
+                    cap = m["float_shares"] or m["shares_out"]
+                    _, proj_to, _ = calculate_turnover_metrics(m["volume"], cap, m["timestamp"])
+                    dp_sr = float(d_df["暗池做空占比%"].iloc[0]) if (d_df is not None and not d_df.empty) else np.nan
+                    trend = "🟢 多头" if (l_row["Close"] > l_row["MA5"] > l_row["MA20"]) else ("🔴 空头" if (l_row["Close"] < l_row["MA5"] < l_row["MA20"]) else "🟡 震荡")
+                    rows_wl.append({
+                        "代码": tk,
+                        "现价($)": round(float(l_row["Close"]), 2),
+                        "涨跌幅%": round(chg, 2),
+                        "趋势结构": trend,
+                        "预估换手%": round(proj_to, 2) if cap else np.nan,
+                        "MFI(14)": round(float(l_row["MFI"]), 1),
+                        "HV20%": round(m["hv20"] * 100, 1) if pd.notnull(m["hv20"]) else np.nan,
+                        "暗池做空%": dp_sr,
+                        "下次财报": str(m["earnings_date"]) if m["earnings_date"] else "-",
+                    })
+                progress.progress((idx + 1) / max(len(wl_tickers), 1))
 
-        if rows_wl:
-            st.dataframe(
-                pd.DataFrame(rows_wl).style.format({
-                    "现价($)": "{:.2f}",
-                    "涨跌幅%": "{:+.2f}%",
-                    "预估换手%": "{:.2f}%",
-                    "MFI(14)": "{:.1f}",
-                    "HV20%": "{:.1f}%",
-                    "暗池做空%": "{:.1f}%",
-                }, na_rep="N/A"),
-                use_container_width=True,
-                hide_index=True,
-            )
+            if rows_wl:
+                st.session_state["wl_result_df"] = pd.DataFrame(rows_wl)
+
+    if "wl_result_df" in st.session_state:
+        st.dataframe(
+            st.session_state["wl_result_df"].style.format({
+                "现价($)": "{:.2f}",
+                "涨跌幅%": "{:+.2f}%",
+                "预估换手%": "{:.2f}%",
+                "MFI(14)": "{:.1f}",
+                "HV20%": "{:.1f}%",
+                "暗池做空%": "{:.1f}%",
+            }, na_rep="N/A"),
+            use_container_width=True,
+            hide_index=True,
+        )
     else:
         st.info("点击上方「一键扫描自选股」即可并发拉取并汇总所有自选标的的核心量化指标。")
