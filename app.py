@@ -186,7 +186,6 @@ def fetch_finra_darkpool_data(ticker_symbol, lookback_days=7):
 
     records = []
     today_et = datetime.now(US_EASTERN_TZ).date()
-    checked = 0
     delta = 0
 
     while len(records) < lookback_days and delta < 15:
@@ -194,13 +193,11 @@ def fetch_finra_darkpool_data(ticker_symbol, lookback_days=7):
         delta += 1
         if d.weekday() >= 5:
             continue
-        checked += 1
         date_str = d.strftime("%Y%m%d")
         url = f"https://cdn.finra.org/equity/regsho/daily/CNMSshvol{date_str}.txt"
         try:
             res = requests.get(url, timeout=4)
             if res.status_code == 200:
-                # 快速按行定位目标 ticker，避免解析整个大文件
                 target_prefix = f"{date_str}|{ticker_symbol.upper()}|"
                 for line in res.text.splitlines():
                     if line.startswith(target_prefix):
@@ -546,7 +543,7 @@ def get_expiration_list(ticker_symbol):
     return exp_list
 
 def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_price):
-    calls_df, puts_df = pd.DataFrame(), pd.DataFrame()
+    calls_df, puts_df, gex_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     call_wall, put_wall, gamma_flip, pcr_oi, pcr_vol = np.nan, np.nan, np.nan, np.nan, np.nan
     atm_iv, move_1d, move_exp = np.nan, np.nan, np.nan
     calc_mode = "持仓量 (OI)"
@@ -568,7 +565,7 @@ def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_pri
                 pass
 
         if calls.empty and puts.empty:
-            return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_oi, pcr_vol, "无数据", "该到期日暂无期权报价", atm_iv, move_1d, move_exp
+            return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_oi, pcr_vol, "无数据", "该到期日暂无期权报价", atm_iv, move_1d, move_exp, gex_df
 
         live_price, _ = get_live_quote(ticker_symbol)
         current_price = float(live_price) if (live_price and live_price > 0) else float(fallback_current_price)
@@ -579,21 +576,17 @@ def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_pri
                     df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0) if col in df.columns else 0.0
                 df["iv_valid"] = (df["impliedVolatility"] > 0.01) & (df["impliedVolatility"] < 5.0)
 
-        # 精确计算距美东收盘 (16:00 ET) 的剩余年化时间 T
         exp_close_et = datetime.strptime(expiration_date, "%Y-%m-%d").replace(hour=16, minute=0, tzinfo=US_EASTERN_TZ)
         hours_to_exp = max((exp_close_et - datetime.now(US_EASTERN_TZ)).total_seconds() / 3600.0, 1.0)
         T = hours_to_exp / (365.0 * 24.0)
 
-        # ATM IV 与预期波幅 (单日按 252 交易日，到期日按实际剩余时间 T)
         all_valid = pd.concat([calls[calls["iv_valid"]], puts[puts["iv_valid"]]], ignore_index=True)
         if not all_valid.empty:
-            # 取最接近现价的 Call & Put 平均 IV
             atm_strikes = all_valid.iloc[(all_valid["strike"] - current_price).abs().argsort()[:2]]
             atm_iv = float(atm_strikes["impliedVolatility"].mean())
             move_1d = current_price * atm_iv * np.sqrt(1.0 / 252.0)
             move_exp = current_price * atm_iv * np.sqrt(T)
 
-        # 过滤极端行权价
         calls = calls[(calls["strike"] >= current_price * 0.3) & (calls["strike"] <= current_price * 2.5)].copy()
         puts = puts[(puts["strike"] >= current_price * 0.3) & (puts["strike"] <= current_price * 2.5)].copy()
 
@@ -618,13 +611,36 @@ def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_pri
             if not p_below.empty:
                 put_wall = float(p_below.loc[p_below[w_col].idxmax(), "strike"])
 
-            # 精准 Black-Scholes 净伽马敞口 (Net GEX) 过零点计算 (跳过 0 持仓合约)
-            s_range = np.linspace(current_price * 0.75, current_price * 1.25, 100)
-            valid_calls = calls[calls["iv_valid"] & (calls[w_col] > 0)]
-            valid_puts = puts[puts["iv_valid"] & (puts[w_col] > 0)]
-
-            net_gammas = []
+            valid_calls = calls[calls["iv_valid"] & (calls[w_col] > 0)].copy()
+            valid_puts = puts[puts["iv_valid"] & (puts[w_col] > 0)].copy()
             sqrt_T = np.sqrt(T)
+
+            # 按行权价计算当前现价下的 Dollar GEX (单位: 百万美元 $M)
+            def _calc_strike_gex(df_leg, sign):
+                if df_leg.empty:
+                    return pd.DataFrame(columns=["strike", "gex"])
+                k = df_leg["strike"].values
+                w = df_leg[w_col].values
+                iv = df_leg["impliedVolatility"].values
+                d1 = (np.log(current_price / k) + (RISK_FREE_RATE + 0.5 * iv ** 2) * T) / (iv * sqrt_T)
+                gamma = np.exp(-0.5 * d1 ** 2) / (current_price * iv * np.sqrt(2 * np.pi * T))
+                gex_m = sign * w * 100.0 * gamma * (current_price ** 2) * 0.01 / 1e6
+                return pd.DataFrame({"strike": k, "gex": gex_m}).groupby("strike", as_index=False)["gex"].sum()
+
+            c_gex = _calc_strike_gex(valid_calls, 1.0).rename(columns={"gex": "call_gex"})
+            p_gex = _calc_strike_gex(valid_puts, -1.0).rename(columns={"gex": "put_gex"})
+            gex_merged = pd.merge(c_gex, p_gex, on="strike", how="outer").fillna(0.0)
+            gex_merged["net_gex"] = gex_merged["call_gex"] + gex_merged["put_gex"]
+            gex_df = gex_merged[
+                (gex_merged["strike"] >= current_price * 0.80) &
+                (gex_merged["strike"] <= current_price * 1.20)
+            ].sort_values("strike").reset_index(drop=True)
+            if gex_df.empty:
+                gex_df = gex_merged.sort_values("strike").reset_index(drop=True)
+
+            # 计算 Gamma Flip 过零点
+            s_range = np.linspace(current_price * 0.75, current_price * 1.25, 100)
+            net_gammas = []
             for s_test in s_range:
                 tot_g = 0.0
                 for df_leg, sign in ((valid_calls, 1.0), (valid_puts, -1.0)):
@@ -635,20 +651,17 @@ def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_pri
                     iv = df_leg["impliedVolatility"].values
                     d1 = (np.log(s_test / k) + (RISK_FREE_RATE + 0.5 * iv ** 2) * T) / (iv * sqrt_T)
                     gamma = np.exp(-0.5 * d1 ** 2) / (s_test * iv * np.sqrt(2 * np.pi * T))
-                    # 乘以 100 股/张及现价平方缩放为 Dollar GEX
                     tot_g += np.sum(sign * w * 100.0 * gamma * (s_test ** 2) * 0.01)
                 net_gammas.append(tot_g)
 
             net_gammas = np.array(net_gammas)
             crossings = np.where(np.diff(np.sign(net_gammas)))[0]
             if len(crossings) > 0:
-                # 选取最接近现价的翻转点
                 best_idx = min(crossings, key=lambda idx: abs(s_range[idx] - current_price))
                 y1, y2 = net_gammas[best_idx], net_gammas[best_idx + 1]
                 x1, x2 = s_range[best_idx], s_range[best_idx + 1]
                 gamma_flip = float(x1 - y1 * (x2 - x1) / (y2 - y1)) if (y2 - y1) != 0 else float(x1)
 
-        # 截取平值附近 9 档合约展示
         for df_type, target_df in [("calls", calls), ("puts", puts)]:
             if not target_df.empty:
                 target_df = target_df.sort_values("strike").reset_index(drop=True)
@@ -663,7 +676,58 @@ def do_fetch_option_details(ticker_symbol, expiration_date, fallback_current_pri
         status_msg = f"期权数据获取失败: {str(e)}"
         calc_mode = "接口异常"
 
-    return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_oi, pcr_vol, calc_mode, status_msg, atm_iv, move_1d, move_exp
+    return calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_oi, pcr_vol, calc_mode, status_msg, atm_iv, move_1d, move_exp, gex_df
+
+def plot_gex_chart(gex_df, current_price, gamma_flip, ticker, selected_exp):
+    colors = ["#26A69A" if v >= 0 else "#EF5350" for v in gex_df["net_gex"]]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=gex_df["strike"],
+        y=gex_df["net_gex"],
+        marker_color=colors,
+        name="Net GEX ($M)",
+        customdata=np.stack((gex_df["call_gex"], gex_df["put_gex"]), axis=-1),
+        hovertemplate=(
+            "<b>行权价: $%{x:.2f}</b><br>"
+            "净伽马 (Net GEX): %{y:+.3f} M<br>"
+            "Call GEX: %{customdata[0]:+.3f} M<br>"
+            "Put GEX: %{customdata[1]:+.3f} M<extra></extra>"
+        ),
+    ))
+
+    fig.add_vline(
+        x=current_price,
+        line_width=2,
+        line_dash="dash",
+        line_color="#1A237E",
+        annotation_text=f"现价 ${current_price:.2f}",
+        annotation_position="top right",
+        annotation_font_color="#1A237E",
+    )
+
+    if pd.notnull(gamma_flip) and gex_df["strike"].min() <= gamma_flip <= gex_df["strike"].max():
+        fig.add_vline(
+            x=gamma_flip,
+            line_width=1.5,
+            line_dash="dot",
+            line_color="#FF9800",
+            annotation_text=f"Flip ${gamma_flip:.2f}",
+            annotation_position="bottom left",
+            annotation_font_color="#E65100",
+        )
+
+    fig.update_layout(
+        title=f"{ticker} ({selected_exp}) 各行权价净伽马敞口 (Net GEX)",
+        xaxis_title="行权价 (Strike $)",
+        yaxis_title="Net GEX (百万美元 / 1% 波动)",
+        height=340,
+        margin=dict(l=10, r=10, t=40, b=20),
+        template="plotly_white",
+        showlegend=False,
+    )
+    fig.add_hline(y=0, line_width=1, line_color="#9E9E9E")
+    return fig
 
 # ==========================================
 # 🔄 9. 线程安全的后台守护进程
@@ -678,8 +742,8 @@ def background_updater_loop():
                     data = do_fetch_stock_data(ticker)
                     if data:
                         with GLOBAL_STORE["lock"]:
-                            GLOBAL_STORE["stock_cache"][f"v10_{ticker}"] = data
-                            GLOBAL_STORE["fetch_timestamps"][f"v10_{ticker}"] = data[3]["timestamp"]
+                            GLOBAL_STORE["stock_cache"][f"v11_{ticker}"] = data
+                            GLOBAL_STORE["fetch_timestamps"][f"v11_{ticker}"] = data[3]["timestamp"]
                 except Exception:
                     pass
                 time.sleep(2.5)
@@ -705,7 +769,6 @@ if "current_ticker" not in st.session_state:
 
 with st.sidebar:
     st.header("🔍 全美股检索")
-    # 1. 支持直接输入任意美股/ETF代码
     direct_input = st.text_input(
         "直接输入任意代码 (回车生效)",
         placeholder="如: PLTR, MSTR, SOXL, BRK-B",
@@ -717,7 +780,6 @@ with st.sidebar:
             GLOBAL_STORE["active_queue"].add(direct_input)
         st.rerun()
 
-    # 2. 全量下拉搜索框 (10,000+ 美股及 ETF)
     default_idx = 0
     for i, item in enumerate(STOCK_LIBRARY):
         if item.startswith(st.session_state.current_ticker + " -"):
@@ -746,15 +808,15 @@ with st.sidebar:
 
     if st.button("🔄 强制刷新当前标的"):
         with GLOBAL_STORE["lock"]:
-            GLOBAL_STORE["stock_cache"].pop(f"v10_{st.session_state.current_ticker}", None)
+            GLOBAL_STORE["stock_cache"].pop(f"v11_{st.session_state.current_ticker}", None)
             GLOBAL_STORE["darkpool_cache"].pop(f"dp_{st.session_state.current_ticker}", None)
         st.rerun()
 
 ticker = st.session_state.current_ticker
 st.title(f"🎯 {ticker} 专业量化决策终端 Pro")
 
-stock_data = GLOBAL_STORE["stock_cache"].get(f"v10_{ticker}")
-last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v10_{ticker}", 0)
+stock_data = GLOBAL_STORE["stock_cache"].get(f"v11_{ticker}")
+last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v11_{ticker}", 0)
 is_expired = (time.time() - last_ts) > get_dynamic_ttl()
 
 if not stock_data or is_expired:
@@ -763,8 +825,8 @@ if not stock_data or is_expired:
         if fresh_data:
             stock_data = fresh_data
             with GLOBAL_STORE["lock"]:
-                GLOBAL_STORE["stock_cache"][f"v10_{ticker}"] = fresh_data
-                GLOBAL_STORE["fetch_timestamps"][f"v10_{ticker}"] = fresh_data[3]["timestamp"]
+                GLOBAL_STORE["stock_cache"][f"v11_{ticker}"] = fresh_data
+                GLOBAL_STORE["fetch_timestamps"][f"v11_{ticker}"] = fresh_data[3]["timestamp"]
                 GLOBAL_STORE["active_queue"].add(ticker)
 
 if not stock_data:
@@ -773,7 +835,6 @@ else:
     hist_df, reg, dp_df, mkt = stock_data
     last = hist_df.iloc[-1]
 
-    # 动态确定换手率分母 (修改侧边栏立即生效)
     if manual_float > 0:
         eff_float, float_label = float(manual_float), "手动修正"
     elif float_mode == "流通股本 (Float)" and mkt["float_shares"]:
@@ -855,14 +916,14 @@ else:
             default_exp_idx = next((i for i, d in enumerate(exp_list) if d >= today_str), 0)
             selected_exp = st.selectbox("📅 选择期权到期日", options=exp_list, index=default_exp_idx)
 
-            opt_key = f"v10_{ticker}_{selected_exp}"
+            opt_key = f"v11_{ticker}_{selected_exp}"
             opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
             if not opt_data or is_expired:
                 opt_data = do_fetch_option_details(ticker, selected_exp, last["Close"])
                 with GLOBAL_STORE["lock"]:
                     GLOBAL_STORE["options_cache"][opt_key] = opt_data
 
-            calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_oi, pcr_vol, calc_mode, status_msg, atm_iv, move_1d, move_exp = opt_data
+            calls_df, puts_df, call_wall, put_wall, gamma_flip, pcr_oi, pcr_vol, calc_mode, status_msg, atm_iv, move_1d, move_exp, gex_df = opt_data
             if status_msg:
                 st.info(f"ℹ️ {status_msg}")
 
@@ -879,6 +940,13 @@ else:
                 em1, em2 = st.columns(2)
                 em1.info(f"🎯 单交易日预期波幅: ±${move_1d:.2f} (${last['Close']-move_1d:.2f} ~ ${last['Close']+move_1d:.2f})")
                 em2.success(f"📅 至 {selected_exp} 预期波幅: ±${move_exp:.2f} (${last['Close']-move_exp:.2f} ~ ${last['Close']+move_exp:.2f})")
+
+            # 渲染 Net GEX 柱状图
+            if not gex_df.empty and gex_df["net_gex"].abs().sum() > 0:
+                gex_fig = plot_gex_chart(gex_df, last["Close"], gamma_flip, ticker, selected_exp)
+                st.plotly_chart(gex_fig, use_container_width=True)
+            else:
+                st.caption("该到期日暂无足够的有效 IV/持仓数据绘制 Net GEX 图。")
 
             t1, t2 = st.tabs(["📈 看涨 (Calls)", "📉 看跌 (Puts)"])
             with t1:
