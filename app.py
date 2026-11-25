@@ -70,7 +70,7 @@ def get_global_data_store():
         "darkpool_cache": {},
         "macro_cache": {"data": None, "ts": 0.0},
         "fetch_timestamps": {},
-        "core_queue": ["NVDA", "AAPL", "TSLA", "BTDR"],
+        "core_queue": ["BTDR", "NVDA", "AAPL", "TSLA"],
         "call_history": [],
         "lock": threading.Lock(),
         "last_yahoo_call_ts": 0.0,
@@ -97,6 +97,7 @@ def check_global_rate_limit(max_calls=MAX_CALLS_PER_MIN):
         return True
 
 def get_dynamic_ttl():
+    """主数据缓存 TTL：交易时段 3 分钟，非交易时段 30 分钟"""
     now_et = datetime.now(US_EASTERN_TZ)
     if now_et.weekday() >= 5:
         return 1800
@@ -105,21 +106,28 @@ def get_dynamic_ttl():
         return 1800
     return 180
 
-def get_live_refresh_interval():
-    """盘前/盘中实时雷达局部刷新秒数，非交易时段返回 None"""
+def get_live_refresh_policy():
+    """
+    根据美东时间返回 (刷新间隔秒数, 当前时段名称)。
+    覆盖早盘前(04:00)至盘后(20:00)，休市/周末返回 (None, '休市')。
+    """
     now_et = datetime.now(US_EASTERN_TZ)
     if now_et.weekday() >= 5:
-        return None
+        return None, "周末休市"
     t_min = now_et.hour * 60 + now_et.minute
-    if 480 <= t_min < 570:      # 盘前 08:00 - 09:30
-        return 60
-    elif 570 <= t_min < 600:    # 开盘黄金30分 09:30 - 10:00
-        return 30
-    elif 600 <= t_min < 900:    # 盘中常规 10:00 - 15:00
-        return 60
-    elif 900 <= t_min < 960:    # 尾盘 15:00 - 16:00
-        return 30
-    return None
+    if 240 <= t_min < 480:       # 早盘前 04:00 - 08:00 ET
+        return 120, "早盘前"
+    elif 480 <= t_min < 570:     # 核心盘前 08:00 - 09:30 ET
+        return 60, "核心盘前"
+    elif 570 <= t_min < 600:     # 开盘黄金30分 09:30 - 10:00 ET
+        return 30, "开盘黄金30分"
+    elif 600 <= t_min < 900:     # 盘中常规 10:00 - 15:00 ET
+        return 60, "盘中常规"
+    elif 900 <= t_min < 960:     # 尾盘博弈 15:00 - 16:00 ET
+        return 30, "尾盘博弈"
+    elif 960 <= t_min < 1200:    # 盘后交易 16:00 - 20:00 ET
+        return 120, "盘后时段"
+    return None, "深夜休市"
 
 def _throttled_yahoo_call(func, max_retries=1):
     if not check_global_rate_limit():
@@ -148,6 +156,7 @@ def _throttled_yahoo_call(func, max_retries=1):
 @st.cache_data(ttl=86400)
 def load_us_stock_library():
     stock_dict = {
+        "BTDR": "Bitdeer Technologies Group",
         "NVDA": "NVIDIA Corporation",
         "AAPL": "Apple Inc.",
         "TSLA": "Tesla, Inc.",
@@ -155,7 +164,6 @@ def load_us_stock_library():
         "AMZN": "Amazon.com, Inc.",
         "GOOG": "Alphabet Inc.",
         "META": "Meta Platforms, Inc.",
-        "BTDR": "Bitdeer Technologies Group",
         "SPY": "SPDR S&P 500 ETF Trust",
         "QQQ": "Invesco QQQ Trust",
         "IWM": "iShares Russell 2000 ETF",
@@ -332,7 +340,6 @@ def fetch_realtime_signal_snapshot(ticker_symbol, fallback_prev_close=None):
         today_et = datetime.now(US_EASTERN_TZ).date()
         today_df = df[df.index.map(lambda x: x.date() == today_et)].copy()
 
-        # 精确提取“上一个交易日”的常规盘收盘价 (09:30 - 16:00 ET)
         prev_days_reg = df[
             df.index.map(lambda x: x.date() < today_et and 570 <= (x.hour * 60 + x.minute) < 960)
         ]
@@ -947,7 +954,6 @@ def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
     t_min = now_et.hour * 60 + now_et.minute
     is_premarket = t_min < 570
 
-    # 1. 盘前预判 (区分高开/低开，并结合盘前量能过滤假异动)
     if is_premarket:
         vol_note = "（盘前成交极少，流动性不足，谨防假突破/假跌破）" if pre_vol < 1000 else ""
         if gap >= 2.0:
@@ -962,7 +968,6 @@ def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
         if avg_daily_vol > 0 and pre_vol > avg_daily_vol * 0.08:
             signals.append(f"🔥 **盘前显著放量**：已成交 {pre_vol:,} 股（超日均量 8%），今日大概率走单边趋势。")
 
-    # 2. 盘中 VWAP & ORB 突破
     if not is_premarket:
         if pd.notnull(snap["vwap"]):
             if price > snap["vwap"] * 1.002:
@@ -978,7 +983,6 @@ def evaluate_intraday_signals(snap, avg_daily_vol, opt_data):
             elif price < snap["orb_low"]:
                 signals.append(f"📉 **跌破开盘 15 分钟低点 (ORB ${snap['orb_low']:.2f})**：日内弱势破位。")
 
-    # 3. 现价与期权墙位联动
     if opt_data:
         _, _, cw, pw, gf, _, _, _, _, _, _, _, _, _ = opt_data
         if pd.notnull(cw) and price >= cw * 0.992:
@@ -1083,8 +1087,8 @@ def background_updater_loop():
                 try:
                     data = do_fetch_stock_data(tk)
                     if data:
-                        safe_cache_set(GLOBAL_STORE["stock_cache"], f"v15_{tk}", data)
-                        safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v15_{tk}", data[3]["timestamp"])
+                        safe_cache_set(GLOBAL_STORE["stock_cache"], f"v16_{tk}", data)
+                        safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v16_{tk}", data[3]["timestamp"])
                 except Exception:
                     pass
                 time.sleep(3.0)
@@ -1106,9 +1110,9 @@ start_background_engine()
 st.markdown("""<style> .main { background-color: #FFFFFF !important; } h2 { color: #1A237E !important; border-bottom: 2px solid #EEE; } </style>""", unsafe_allow_html=True)
 
 if "current_ticker" not in st.session_state:
-    st.session_state.current_ticker = "NVDA"
+    st.session_state.current_ticker = "BTDR"
 if "watchlist" not in st.session_state:
-    st.session_state.watchlist = ["NVDA", "AAPL", "TSLA", "MSFT", "BTDR"]
+    st.session_state.watchlist = ["BTDR", "NVDA", "AAPL", "TSLA", "MSFT"]
 
 with st.sidebar:
     st.header("🔍 全美股检索")
@@ -1125,8 +1129,8 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.subheader("⚙️ 刷新与防刷设置")
-    auto_refresh_on = st.toggle("📡 开启盘前/盘中自动刷新", value=False, help="默认关闭以节省额度，盯盘时可手动开启")
+    st.subheader("⚙️ 分时段自动刷新")
+    auto_refresh_on = st.toggle("📡 分时段自动刷新雷达", value=True, help="按美东时间自动调整刷新频率：开盘/尾盘30s，盘中/核心盘前60s，早盘前/盘后120s，休市暂停")
 
     if st.button("🔄 强制刷新当前标的"):
         now = time.time()
@@ -1136,7 +1140,7 @@ with st.sidebar:
         else:
             st.session_state["last_manual_refresh"] = now
             with GLOBAL_STORE["lock"]:
-                GLOBAL_STORE["stock_cache"].pop(f"v15_{st.session_state.current_ticker}", None)
+                GLOBAL_STORE["stock_cache"].pop(f"v16_{st.session_state.current_ticker}", None)
                 GLOBAL_STORE["darkpool_cache"].pop(f"dp_{st.session_state.current_ticker}", None)
                 GLOBAL_STORE["intraday_cache"].pop(f"{st.session_state.current_ticker}_15m", None)
                 GLOBAL_STORE["intraday_cache"].pop(f"{st.session_state.current_ticker}_60m", None)
@@ -1161,8 +1165,8 @@ with tab_main:
     ticker = st.session_state.current_ticker
     st.title(f"🎯 {ticker} 专业量化决策终端 Pro")
 
-    stock_data = GLOBAL_STORE["stock_cache"].get(f"v15_{ticker}")
-    last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v15_{ticker}", 0)
+    stock_data = GLOBAL_STORE["stock_cache"].get(f"v16_{ticker}")
+    last_ts = GLOBAL_STORE["fetch_timestamps"].get(f"v16_{ticker}", 0)
     is_expired = (time.time() - last_ts) > get_dynamic_ttl()
 
     if not stock_data or is_expired:
@@ -1170,8 +1174,8 @@ with tab_main:
             fresh_data = do_fetch_stock_data(ticker)
             if fresh_data:
                 stock_data = fresh_data
-                safe_cache_set(GLOBAL_STORE["stock_cache"], f"v15_{ticker}", fresh_data)
-                safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v15_{ticker}", fresh_data[3]["timestamp"])
+                safe_cache_set(GLOBAL_STORE["stock_cache"], f"v16_{ticker}", fresh_data)
+                safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v16_{ticker}", fresh_data[3]["timestamp"])
 
     if not stock_data:
         st.error(f"⚠️ 无法拉取 **{ticker}** 的数据（可能代码有误、数据源波动，或触发了全站频率熔断保护，请稍后再试）。")
@@ -1221,7 +1225,7 @@ with tab_main:
                     target_exps = [selected_exp]
                     selected_exp_label = selected_exp
 
-                opt_key = f"v15_{ticker}_{'_'.join(target_exps)}"
+                opt_key = f"v16_{ticker}_{'_'.join(target_exps)}"
                 opt_data = GLOBAL_STORE["options_cache"].get(opt_key)
                 if not opt_data or is_expired:
                     with st.spinner("🕯️ 正在计算期权链与 GEX..."):
@@ -1237,15 +1241,23 @@ with tab_main:
         else:
             daily_prev_close = float(hist_df["Close"].iloc[-2]) if len(hist_df) >= 2 else float(hist_df["Close"].iloc[-1])
 
-        # 📡 盘前/盘中局部自动刷新信号雷达
-        refresh_sec = get_live_refresh_interval() if auto_refresh_on else None
+        # 📡 分时段自动刷新信号雷达 (@st.fragment)
+        policy_sec, market_phase = get_live_refresh_policy()
+        refresh_sec = policy_sec if auto_refresh_on else None
 
         @st.fragment(run_every=refresh_sec)
         def render_live_radar(ticker_sym, avg_vol, opt_snapshot, fb_prev_close):
             snap = fetch_realtime_signal_snapshot(ticker_sym, fb_prev_close)
             if not snap:
                 return
-            status_txt = f"自动刷新中 (每 {refresh_sec}s)" if refresh_sec else "手动模式 (可在左侧开启盘中自动刷新)"
+            cur_sec, cur_phase = get_live_refresh_policy()
+            if auto_refresh_on and cur_sec:
+                status_txt = f"🟢 {cur_phase} · 自动刷新中 (每 {cur_sec}s)"
+            elif not auto_refresh_on:
+                status_txt = f"⏸️ {cur_phase} · 已手动关闭自动刷新"
+            else:
+                status_txt = f"🌙 {cur_phase} · 已自动暂停刷新"
+
             with st.container(border=True):
                 st.caption(f"📡 **盘前/盘中实时信号雷达** | 昨收基准: **${snap['prev_close']:.2f}** | 更新于 {snap['update_time']} (北京时间) | {status_txt}")
                 r1, r2, r3, r4 = st.columns(4)
@@ -1437,12 +1449,12 @@ with tab_watch:
             rows_wl = []
             progress = st.progress(0)
             for idx, tk in enumerate(wl_tickers):
-                data = GLOBAL_STORE["stock_cache"].get(f"v15_{tk}")
+                data = GLOBAL_STORE["stock_cache"].get(f"v16_{tk}")
                 if not data:
                     data = do_fetch_stock_data(tk)
                     if data:
-                        safe_cache_set(GLOBAL_STORE["stock_cache"], f"v15_{tk}", data)
-                        safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v15_{tk}", data[3]["timestamp"])
+                        safe_cache_set(GLOBAL_STORE["stock_cache"], f"v16_{tk}", data)
+                        safe_cache_set(GLOBAL_STORE["fetch_timestamps"], f"v16_{tk}", data[3]["timestamp"])
                 if data:
                     h_df, _, d_df, m = data
                     l_row = h_df.iloc[-1]
@@ -1474,7 +1486,7 @@ with tab_watch:
                 "涨跌幅%": "{:+.2f}%",
                 "预估换手%": "{:.2f}%",
                 "MFI(14)": "{:.1f}",
-                "HV20%": "{:.1f}",
+                "HV20%": "{:.1f}%",
                 "暗池做空%": "{:.1f}%",
             }, na_rep="N/A"),
             use_container_width=True,
